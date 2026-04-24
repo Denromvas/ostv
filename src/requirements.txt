@@ -1,0 +1,2 @@
+# OsTv v0.0.1 Python deps
+textual>=0.50.0

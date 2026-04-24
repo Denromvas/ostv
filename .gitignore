@@ -1,0 +1,31 @@
+# Build artifacts
+dist/ostv-ui
+dist/*.tar.gz
+src-tauri-ui/src-tauri/target/
+src-tauri-ui/node_modules/
+src-tauri-ui/dist/
+src-tauri-ui/package-lock.json
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+
+# Secrets — ніколи не commit
+secrets.env
+*.key
+.credentials.json
+
+# OS / editors
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+*.swp
+*~
+
+# Runtime
+*.log
+*.pid
