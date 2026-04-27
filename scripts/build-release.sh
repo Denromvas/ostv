@@ -22,7 +22,7 @@ VERSION="${1:-0.1.0}"
 if [[ "$1" == "--version" ]]; then VERSION="$2"; fi
 
 OSTV_SRC="${OSTV_SRC:-/mnt/e/OsTv}"
-TARGET_HOST="${TARGET_HOST:-192.168.88.29}"
+TARGET_HOST="${TARGET_HOST:-}"
 TARGET_USER="${TARGET_USER:-dromanyuk}"
 
 OUTDIR=$(mktemp -d -t ostv-build-XXXX)

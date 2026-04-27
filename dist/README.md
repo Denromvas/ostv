@@ -56,5 +56,5 @@ bash scripts/build-release.sh 0.1.1
 
 Це автоматично:
 1. Копіює Brain + parsers з `/mnt/e/OsTv/src/`
-2. Pull-ить Tauri binary з target (192.168.88.29)
+2. Pull-ить Tauri binary з `$TARGET_HOST` (передавати env-змінною)
 3. Пакує все в `ostv-release-v<ver>.tar.gz`

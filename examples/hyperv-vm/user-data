@@ -1,0 +1,62 @@
+#cloud-config
+# OsTv Hyper-V VM seed — створює юзера tv з тимчасовим паролем "ostv".
+# ⚠ ОБОВ'ЯЗКОВО ЗМІНИ ПАРОЛЬ після першого логіну: `passwd tv`
+hostname: ostv-vm
+manage_etc_hosts: true
+locale: uk_UA.UTF-8
+timezone: Europe/Kyiv
+
+users:
+  - name: tv
+    plain_text_passwd: ostv
+    lock_passwd: false
+    shell: /bin/bash
+    sudo: ALL=(ALL) NOPASSWD:ALL
+    groups: [sudo, audio, video, input]
+
+ssh_pwauth: true
+chpasswd:
+  expire: false
+
+package_update: true
+package_upgrade: false
+packages:
+  - curl
+  - wget
+  - tar
+  - git
+  - openssh-server
+  - sudo
+  - ca-certificates
+
+write_files:
+  - path: /usr/local/bin/ostv-bootstrap.sh
+    permissions: '0755'
+    owner: root:root
+    content: |
+      #!/bin/bash
+      set -eu
+      LOG=/var/log/ostv-install.log
+      exec >>"$LOG" 2>&1
+      echo "=== $(date) ostv-bootstrap start ==="
+      cd /tmp
+      # Fetch latest release from GitHub
+      LATEST=$(curl -fsSL https://api.github.com/repos/Denromvas/ostv/releases/latest \
+        | python3 -c 'import json,sys;d=json.load(sys.stdin);print(d["tag_name"])')
+      VER="${LATEST#v}"
+      URL="https://github.com/Denromvas/ostv/releases/download/$LATEST/ostv-release-$LATEST.tar.gz"
+      echo "downloading $URL ..."
+      wget -q --tries=5 --timeout=30 "$URL" -O "ostv-release-$LATEST.tar.gz"
+      tar -xzOf "ostv-release-$LATEST.tar.gz" release/install.sh > /tmp/install.sh
+      bash /tmp/install.sh --local "/tmp/ostv-release-$LATEST.tar.gz" < /dev/null
+      echo "=== $(date) ostv-bootstrap done → $VER ==="
+      mkdir -p /var/lib/ostv && touch /var/lib/ostv/.installed
+
+runcmd:
+  - [ systemctl, enable, --now, ssh ]
+  - [ /usr/local/bin/ostv-bootstrap.sh ]
+
+final_message: |
+  OsTv VM ready in $UPTIME seconds.
+  SSH: tv@<vm-ip> (password: ostv)
+  ⚠ FIRST THING: ssh in and run `passwd` to change the default password.

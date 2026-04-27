@@ -226,5 +226,6 @@ MIT License — robити що хочеш, fork/modify/sell.
 
 ## Статус
 
-**PoC розгорнуто та тестується на 192.168.88.29** (HP Pro 3500 Series, Intel i5-2400, NVIDIA GT 630 nouveau).
-Домашня мережа Дениса, повсякденне використання. Public release: коли стабілізуємо після 1-2 тижнів use.
+**PoC розгорнуто та тестується** на HP Pro 3500 Series (Intel i5-2400, NVIDIA GT 630 nouveau)
+у домашньому використанні + Hyper-V VM (Win11 Pro, Default Switch).
+Public release: коли стабілізуємо після 1-2 тижнів use.

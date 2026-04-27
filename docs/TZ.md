@@ -1295,7 +1295,7 @@ root    ─everything─→ (тільки системні сервіси)
 
 ### 20.3. Цільова машина прототипу (наявна)
 
-**HP Pro 3500 Series**, розміщений на 192.168.88.29:
+**HP Pro 3500 Series** (приклад цільового заліза):
 - Intel Core i5-2400 (Sandy Bridge, 4 ядра, 3.1 GHz)
 - NVIDIA GeForce GT 630 (GF108 Fermi) — VDPAU feature set D
 - 9.7 ГБ DDR3 RAM
@@ -1375,7 +1375,7 @@ journalctl -u ostv-brain -n 100 --no-pager
 - Тільки сirror statistics (startup time, crash reports).
 - Анонімний UUID машини.
 - Жодного контенту користувача (назви фільмів, запити).
-- Self-hosted endpoint (наприклад, 188.191.238.48/ostv-telemetry, як зроблено для winmux на Pop!_OS 192.168.88.28).
+- Self-hosted endpoint (наприклад, `https://your-server.example/ostv-telemetry`).
 
 ---
 
@@ -1470,7 +1470,7 @@ DEEPGRAM_API_KEY=...
 
 ### Етап 1 — "Hello World" PoC
 **Термін:** 2-3 тижні.
-- [ ] Ubuntu 24.04 minimal на 192.168.88.29.
+- [ ] Ubuntu 24.04 minimal на цільовому залізі.
 - [ ] Написати `ostv-brain` найпростіший: сокет + 1 tool = "play_youtube(url)".
 - [ ] Написати UI на Textual з 1 іконкою "YouTube".
 - [ ] Кнопка OK → Brain → yt-dlp → mpv.
@@ -1601,7 +1601,7 @@ Transport: mDNS discovery + WebSocket over LAN.
 - Налаштування користувача (theme, layout, API-keys) синхронізуються через self-hosted endpoint
 - Install modules (weather_chernivtsi) переносяться між пристроями
 - Watchlist синхронізується через Cinema Portal backend
-- Self-hosted (без зовнішніх сервісів): Denis's Pop!_OS 192.168.88.28 як central server
+- Self-hosted (без зовнішніх сервісів): свій Pop!_OS / Linux server як central
 
 ### 28.4. Smart Home integration
 Home Assistant API (у Дениса налаштований) → Brain tool:
@@ -1650,7 +1650,7 @@ Home Assistant API (у Дениса налаштований) → Brain tool:
 - **B. Повний системний prompt AI**
 - **C. Dockerfile шаблон для парсера**
 - **D. API reference для модуль-розробників**
-- **E. Скрипти автоматичного розгортання PoC на 192.168.88.29**
+- **E. Скрипти автоматичного розгортання PoC**
 - **F. Real Filmix parser** (reverse mobile APK — окрема дослідницька робота)
 - **G. Cinema Portal ↔ OsTv REST bridge**
 - **H. Mobile companion Flutter скелет**
