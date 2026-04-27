@@ -24,7 +24,7 @@
 
 set -e
 
-OSTV_VERSION="${OSTV_VERSION:-0.1.0}"
+OSTV_VERSION="${OSTV_VERSION:-0.1.1}"
 RELEASE_URL="${RELEASE_URL:-https://denromvas.website/ostv/ostv-release-v${OSTV_VERSION}.tar.gz}"
 LOCAL_TARBALL=""
 SKIP_KIOSK=0
@@ -127,8 +127,11 @@ passwd -d tv
 # ---- 4. Layout ----
 echo ""
 echo "=== 4. Layout /opt/ostv ==="
-mkdir -p /opt/ostv/{bin,brain,ui,apps,parsers,shared}
+mkdir -p /opt/ostv/{bin,brain,ui,apps,parsers,shared,scripts}
 mkdir -p /etc/ostv /var/log/ostv /var/lib/ostv/pending
+
+# version pin (для update.sh порівняння)
+echo "$OSTV_VERSION" > /etc/ostv/version
 
 cat > /usr/lib/tmpfiles.d/ostv.conf <<EOF
 d /run/ostv 0775 root ostv -
@@ -143,6 +146,13 @@ cp -r "$RELEASE_ROOT/brain/"* /opt/ostv/brain/
 cp -r "$RELEASE_ROOT/parsers/"* /opt/ostv/parsers/
 cp -r "$RELEASE_ROOT/bin/"* /opt/ostv/bin/
 cp "$RELEASE_ROOT/mpv.input.conf" /opt/ostv/mpv.input.conf 2>/dev/null || true
+
+# updater
+if [ -f "$RELEASE_ROOT/update.sh" ]; then
+    cp "$RELEASE_ROOT/update.sh" /opt/ostv/scripts/update.sh
+    chmod 0755 /opt/ostv/scripts/update.sh
+    chown root:root /opt/ostv/scripts/update.sh
+fi
 
 [ -f /etc/ostv/config.toml ] || cp "$RELEASE_ROOT/config/config.toml" /etc/ostv/config.toml 2>/dev/null || true
 [ -f /etc/ostv/secrets.env ] || cat > /etc/ostv/secrets.env <<EOF
@@ -173,6 +183,17 @@ fi
     requests beautifulsoup4 \
     2>&1 | tail -3
 chown -R ostv:ostv /opt/ostv/venv
+
+# ---- 6.5. sudoers: tv NOPASSWD power ----
+echo ""
+echo "=== 6.5. sudoers rule for power commands ==="
+cat > /etc/sudoers.d/ostv <<'EOF'
+# OsTv Brain — tv user NOPASSWD on power management + updater
+tv ALL=(root) NOPASSWD: /usr/bin/systemctl reboot, /usr/bin/systemctl poweroff, /usr/bin/systemctl suspend, /usr/bin/systemctl halt
+tv ALL=(root) NOPASSWD: /opt/ostv/scripts/update.sh
+EOF
+chmod 0440 /etc/sudoers.d/ostv
+visudo -c -f /etc/sudoers.d/ostv || { echo "!!! bad sudoers"; rm /etc/sudoers.d/ostv; exit 1; }
 
 # ---- 7. Brain systemd ----
 echo ""
@@ -243,9 +264,14 @@ XI
     chown tv:tv /home/tv/.xinitrc
     chmod +x /home/tv/.xinitrc
 
+    # log dir для xsession.log + startx.err (інакше exec startx падає bash з No such file)
+    mkdir -p /home/tv/.local/share/ostv
+    chown -R tv:tv /home/tv/.local
+
     # .bash_profile autostart X
     cat > /home/tv/.bash_profile <<'BP'
 if [[ -z $DISPLAY ]] && [[ $(tty) = /dev/tty1 ]]; then
+    mkdir -p /home/tv/.local/share/ostv
     exec startx 2>/home/tv/.local/share/ostv/startx.err
 fi
 BP

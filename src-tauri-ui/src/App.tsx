@@ -138,6 +138,20 @@ const APPS: AppConfig[] = [
       "...RRRRRRRR.....", "....RR..RR......", "................",
     ],
   },
+  {
+    id: "power", name: "Power", color: "#c01c28",
+    sprite: [
+      "................",
+      "................",
+      ".......WW.......",
+      "....RR.WW.RR....",
+      "...R...WW...R...",
+      "..R....WW....R..",
+      "..R..........R..",
+      "..RR........RR..",
+      "...RRRRRRRRRR...",
+    ],
+  },
 ];
 
 // ============ Pixel Sprite ============
@@ -432,7 +446,13 @@ function SourceScreen({ onBack, title, brainMethod, accentColor, placeholder }: 
     try {
       const r = await invoke<any>("brain_call", {
         method: "play_url",
-        params: { url: v.url },
+        params: {
+          url: v.url,
+          title: v.title,
+          source: v.source,
+          thumbnail: v.thumbnail,
+          query: query,
+        },
       });
       const err = r?.result?.error || r?.error;
       if (err) {
@@ -594,6 +614,78 @@ function fmtDuration(sec: number): string {
     ? `${h}:${String(m).padStart(2, "0")}:${String(s).padStart(2, "0")}`
     : `${m}:${String(s).padStart(2, "0")}`;
 }
+
+// ============ Power Overlay ============
+function PowerOverlay({ onClose }: { onClose: () => void }) {
+  const [focused, setFocused] = useState(0);
+  const [status, setStatus] = useState<string | null>(null);
+
+  const actions = [
+    { id: "soft_reload", label: "ОНОВИТИ UI", icon: "⟳", color: "#41ff7a", confirm: null as string | null },
+    { id: "hard_reload", label: "ПЕРЕЗАПУСК UI", icon: "⥁", color: "#41c8ff", confirm: "перезапустити графічну оболонку?" },
+    { id: "reboot",    label: "РЕСТАРТ",    icon: "↻", color: "#ffd000", confirm: "перезавантажити систему?" },
+    { id: "shutdown",  label: "ВИМКНУТИ",   icon: "⏻", color: "#c01c28", confirm: "вимкнути пристрій?" },
+    { id: "suspend",   label: "СОН",        icon: "☾", color: "#7a55ff", confirm: "перевести у режим сну?" },
+    { id: "logout",    label: "ЛОГАУТ",     icon: "⤴", color: "#888888", confirm: "вийти з сесії (перезапустить UI)?" },
+    { id: "cancel",    label: "СКАСУВАТИ",  icon: "✕", color: "#555555", confirm: null as string | null },
+  ];
+
+  const execute = useCallback(async (action: typeof actions[0]) => {
+    if (action.id === "cancel") { onClose(); return; }
+    if (action.confirm && !confirm(action.confirm)) return;
+    setStatus(`${action.icon} ${action.label}...`);
+    if (action.id === "soft_reload") {
+      window.location.reload();
+      return;
+    }
+    try {
+      const method = action.id === "hard_reload" ? "reload_ui" : "power";
+      const params = action.id === "hard_reload" ? { hard: true } : { action: action.id };
+      await invoke<any>("brain_call", { method, params });
+      // Success = машина/UI перезапускається, вікно зникне.
+    } catch (e) {
+      setStatus(`✗ ${e}`);
+    }
+  }, [onClose]);
+
+  useEffect(() => {
+    function h(e: KeyboardEvent) {
+      if (e.key === "Escape") { e.preventDefault(); onClose(); return; }
+      if (e.key === "ArrowDown" || e.key === "ArrowRight") {
+        e.preventDefault(); setFocused(i => Math.min(actions.length - 1, i + 1));
+      } else if (e.key === "ArrowUp" || e.key === "ArrowLeft") {
+        e.preventDefault(); setFocused(i => Math.max(0, i - 1));
+      } else if (e.key === "Enter") {
+        e.preventDefault(); execute(actions[focused]);
+      }
+    }
+    window.addEventListener("keydown", h);
+    return () => window.removeEventListener("keydown", h);
+  }, [focused, actions, execute, onClose]);
+
+  return (
+    <div className="power-overlay" onClick={onClose}>
+      <div className="power-box" onClick={(e) => e.stopPropagation()}>
+        <div className="power-title">◉ POWER</div>
+        <div className="power-list">
+          {actions.map((a, idx) => (
+            <div key={a.id}
+                 className={`power-item ${idx === focused ? "focused" : ""}`}
+                 style={{ borderColor: idx === focused ? a.color : "#333" }}
+                 onClick={() => { setFocused(idx); execute(a); }}
+                 onMouseEnter={() => setFocused(idx)}>
+              <span className="power-icon" style={{ color: a.color }}>{a.icon}</span>
+              <span className="power-label">{a.label}</span>
+            </div>
+          ))}
+        </div>
+        {status && <div className="power-status">{status}</div>}
+        <div className="power-hint">↑↓ NAV · [ENTER] · [ESC] скасувати</div>
+      </div>
+    </div>
+  );
+}
+
 
 // ============ Launch Overlay (loading indicator) ============
 const LaunchOverlay = memo(function LaunchOverlay({ title, detail }: { title: string; detail?: string }) {
@@ -927,6 +1019,8 @@ function SettingsScreen({ onBack, settings, onChange }: {
   const [brainVersion, setBrainVersion] = useState<string>("?");
   const [apiKeyStatus, setApiKeyStatus] = useState<string>("?");
   const [apps, setApps] = useState<any[]>([]);
+  const [updateInfo, setUpdateInfo] = useState<string>("(не перевірено)");
+  const [updating, setUpdating] = useState(false);
 
   const reloadApps = useCallback(async () => {
     try {
@@ -961,6 +1055,33 @@ function SettingsScreen({ onBack, settings, onChange }: {
       .catch(() => setApiKeyStatus("offline"));
   }, []);
 
+  const checkUpdate = useCallback(async () => {
+    setUpdateInfo("перевіряю...");
+    try {
+      const r = await invoke<any>("brain_call", { method: "update_check", params: {} });
+      const v = r?.result;
+      if (!v?.ok) { setUpdateInfo(`✗ ${v?.error || "помилка"}`); return; }
+      if (v.has_update) {
+        setUpdateInfo(`↑ є оновлення: ${v.current} → ${v.latest}`);
+      } else {
+        setUpdateInfo(`✓ актуально (${v.current})`);
+      }
+    } catch (e) { setUpdateInfo(`✗ ${e}`); }
+  }, []);
+
+  const applyUpdate = useCallback(async () => {
+    if (!confirm("Завантажити та встановити оновлення з GitHub? UI рестартує сам.")) return;
+    setUpdating(true);
+    setUpdateInfo("оновлення триває (~2 хв)...");
+    try {
+      await invoke<any>("brain_call", { method: "update_apply", params: {} });
+      setUpdateInfo("⏳ скачується + ставиться, UI рестартує");
+    } catch (e) {
+      setUpdateInfo(`✗ ${e}`);
+      setUpdating(false);
+    }
+  }, []);
+
   const rows = [
     { label: "CRT Scanlines", value: settings.scanlines ? "ON" : "OFF",
       onToggle: () => onChange({ ...settings, scanlines: !settings.scanlines }) },
@@ -972,6 +1093,12 @@ function SettingsScreen({ onBack, settings, onChange }: {
       } },
     { label: "Brain version", value: brainVersion, onToggle: () => {} },
     { label: "Anthropic API key", value: apiKeyStatus, onToggle: () => {} },
+    { label: "OsTv updates", value: updateInfo,
+      onToggle: () => {
+        if (updating) return;
+        if (updateInfo.startsWith("↑")) applyUpdate();
+        else checkUpdate();
+      } },
   ];
 
   useEffect(() => {
@@ -1183,12 +1310,203 @@ interface ChatMessage {
   actions?: any[];
 }
 
+// ============ History Sidebar (left) ============
+type HistItem = {
+  id: string;
+  title: string;
+  source: string;
+  original_url: string;
+  thumbnail?: string | null;
+  position_sec: number;
+  duration_sec: number;
+  last_watched: number;
+  finished: boolean;
+};
+
+function _humanAgo(ts: number): string {
+  const sec = Math.max(0, Math.floor(Date.now() / 1000 - ts));
+  if (sec < 60) return `${sec}с тому`;
+  if (sec < 3600) return `${Math.floor(sec / 60)} хв тому`;
+  if (sec < 86400) return `${Math.floor(sec / 3600)} год тому`;
+  return `${Math.floor(sec / 86400)} дн тому`;
+}
+
+function _humanTime(sec: number): string {
+  if (!sec || sec < 1) return "";
+  const h = Math.floor(sec / 3600);
+  const m = Math.floor((sec % 3600) / 60);
+  const s = Math.floor(sec % 60);
+  if (h > 0) return `${h}:${String(m).padStart(2, "0")}:${String(s).padStart(2, "0")}`;
+  return `${m}:${String(s).padStart(2, "0")}`;
+}
+
+function HistorySidebar({ open, onClose, onResumed }: {
+  open: boolean; onClose: () => void; onResumed: (title: string) => void;
+}) {
+  const [items, setItems] = useState<HistItem[]>([]);
+  const [loading, setLoading] = useState(false);
+  const [focused, setFocused] = useState(0);
+
+  const reload = useCallback(async () => {
+    setLoading(true);
+    try {
+      const r = await invoke<any>("brain_call", {
+        method: "history_list",
+        params: { limit: 50, include_finished: true },
+      });
+      const its = r?.result?.items || [];
+      setItems(its);
+      setFocused(0);
+    } catch {
+      setItems([]);
+    } finally {
+      setLoading(false);
+    }
+  }, []);
+
+  useEffect(() => { if (open) reload(); }, [open, reload]);
+
+  const resume = useCallback(async (it: HistItem) => {
+    onResumed(it.title);
+    onClose();
+    try {
+      await invoke<any>("brain_call", {
+        method: "history_resume",
+        params: { id: it.id },
+      });
+    } catch (e) {
+      alert(`Resume failed: ${e}`);
+    }
+  }, [onClose, onResumed]);
+
+  const remove = useCallback(async (e: React.MouseEvent, it: HistItem) => {
+    e.stopPropagation();
+    if (!confirm(`Видалити «${it.title}» з історії?`)) return;
+    try {
+      await invoke<any>("brain_call", { method: "history_remove", params: { id: it.id } });
+      reload();
+    } catch {}
+  }, [reload]);
+
+  const clearAll = useCallback(async () => {
+    if (!confirm("Очистити ВСЮ історію перегляду?")) return;
+    try {
+      await invoke<any>("brain_call", { method: "history_clear", params: { only_finished: false } });
+      reload();
+    } catch {}
+  }, [reload]);
+
+  const clearFinished = useCallback(async () => {
+    try {
+      await invoke<any>("brain_call", { method: "history_clear", params: { only_finished: true } });
+      reload();
+    } catch {}
+  }, [reload]);
+
+  useEffect(() => {
+    if (!open) return;
+    function h(e: KeyboardEvent) {
+      if (e.key === "Escape") { e.preventDefault(); onClose(); return; }
+      if (e.key === "ArrowDown") {
+        e.preventDefault(); setFocused(i => Math.min(items.length - 1, i + 1));
+      } else if (e.key === "ArrowUp") {
+        e.preventDefault(); setFocused(i => Math.max(0, i - 1));
+      } else if (e.key === "Enter" && items[focused]) {
+        e.preventDefault(); resume(items[focused]);
+      }
+    }
+    window.addEventListener("keydown", h);
+    return () => window.removeEventListener("keydown", h);
+  }, [open, items, focused, resume, onClose]);
+
+  return (
+    <aside className={`hist-sidebar ${open ? "open" : ""}`}>
+      <div className="hist-header">
+        <span className="hist-title">▶ ІСТОРІЯ</span>
+        <div style={{ display: "flex", gap: 6 }}>
+          <button className="ai-close" title="Оновити" onClick={reload}>↻</button>
+          <button className="ai-close" title="Видалити переглянуті" onClick={clearFinished}>✓✕</button>
+          <button className="ai-close" title="Очистити все" onClick={clearAll}>🗑</button>
+          <button className="ai-close" onClick={onClose}>✕</button>
+        </div>
+      </div>
+      <div className="hist-list">
+        {loading && <div className="hist-empty">завантаження...</div>}
+        {!loading && items.length === 0 && (
+          <div className="hist-empty">
+            Поки порожньо.<br/>
+            Запусти будь-який фільм/відео — і він з'явиться тут для resume.
+          </div>
+        )}
+        {items.map((it, idx) => {
+          const dur = it.duration_sec || 0;
+          const pos = it.position_sec || 0;
+          const pct = dur > 0 ? Math.min(100, (pos / dur) * 100) : 0;
+          return (
+            <div
+              key={it.id}
+              className={`hist-item ${idx === focused ? "focused" : ""} ${it.finished ? "finished" : ""}`}
+              onClick={() => resume(it)}
+              onMouseEnter={() => setFocused(idx)}
+            >
+              <div className="hist-item-row">
+                <span className={`hist-badge ${it.source}`}>{it.source.toUpperCase()}</span>
+                <span className="hist-title-text" title={it.title}>{it.title}</span>
+              </div>
+              {dur > 0 && (
+                <div className={`hist-progress ${it.finished ? "full" : ""}`}>
+                  <div className="hist-progress-fill" style={{ width: `${pct}%` }} />
+                </div>
+              )}
+              <div className="hist-meta">
+                <span>
+                  {it.finished
+                    ? "✓ переглянуто"
+                    : pos > 5
+                      ? `${_humanTime(pos)}${dur ? ` / ${_humanTime(dur)}` : ""}`
+                      : "не починався"}
+                </span>
+                <span>{_humanAgo(it.last_watched)}</span>
+              </div>
+              <div className="hist-actions">
+                <button className="hist-act-btn" onClick={(e) => { e.stopPropagation(); resume(it); }}>
+                  {it.finished ? "▶ ЗАНОВО" : pos > 5 ? "▶ ПРОДОВЖИТИ" : "▶ СТАРТ"}
+                </button>
+                <button className="hist-act-btn danger" onClick={(e) => remove(e, it)}>✕</button>
+              </div>
+            </div>
+          );
+        })}
+      </div>
+    </aside>
+  );
+}
+
+
 function AiChatSidebar({ open, onClose }: { open: boolean; onClose: () => void }) {
-  const [messages, setMessages] = useState<ChatMessage[]>([]);
+  const [messages, setMessages] = useState<ChatMessage[]>(() => {
+    try {
+      const raw = localStorage.getItem("ostv.aichat.history");
+      return raw ? JSON.parse(raw).slice(-30) : [];  // last 30 messages
+    } catch { return []; }
+  });
   const [input, setInput] = useState("");
   const [loading, setLoading] = useState(false);
+  const [oskOpen, setOskOpen] = useState(false);
   const inputRef = useRef<HTMLTextAreaElement>(null);
   const listRef = useRef<HTMLDivElement>(null);
+
+  // Persist на кожен change
+  useEffect(() => {
+    try { localStorage.setItem("ostv.aichat.history", JSON.stringify(messages.slice(-30))); } catch {}
+  }, [messages]);
+
+  const clearHistory = useCallback(() => {
+    if (confirm("Видалити історію чату?")) {
+      setMessages([]);
+      localStorage.removeItem("ostv.aichat.history");
+    }
+  }, []);
 
   useEffect(() => {
     if (open) {
@@ -1247,7 +1565,11 @@ function AiChatSidebar({ open, onClose }: { open: boolean; onClose: () => void }
     <aside className={`ai-sidebar ${open ? "open" : ""}`}>
       <div className="ai-header">
         <span className="ai-title">◉ CLAUDE</span>
-        <button className="ai-close" onClick={onClose}>✕</button>
+        <div style={{ display: "flex", gap: 6 }}>
+          <button className="ai-close" title="Екранна клавіатура" onClick={() => setOskOpen(true)}>⌨</button>
+          <button className="ai-close" title="Очистити історію" onClick={clearHistory}>🗑</button>
+          <button className="ai-close" onClick={onClose}>✕</button>
+        </div>
       </div>
 
       <div className="ai-messages" ref={listRef}>
@@ -1301,6 +1623,14 @@ function AiChatSidebar({ open, onClose }: { open: boolean; onClose: () => void }
           ▶
         </button>
       </div>
+      {oskOpen && (
+        <OnScreenKeyboard
+          value={input}
+          onChange={setInput}
+          onSubmit={() => { setOskOpen(false); send(); }}
+          onClose={() => setOskOpen(false)}
+        />
+      )}
     </aside>
   );
 }
@@ -1362,6 +1692,8 @@ const ScreenSaver = memo(function ScreenSaver({ onWake }: { onWake: () => void }
 export default function App() {
   const [screen, setScreen] = useState<Screen>("boot");
   const [aiOpen, setAiOpen] = useState(false);
+  const [histOpen, setHistOpen] = useState(false);
+  const [powerOpen, setPowerOpen] = useState(false);
   const [toast, setToast] = useState<string | null>(null);
   const [settings, setSettings] = useState<OsTvSettings>(loadSettings);
   const [idle, setIdle] = useState(false);
@@ -1393,6 +1725,7 @@ export default function App() {
   }, []);
 
   const openApp = useCallback((app: AppConfig) => {
+    if (app.id === "power") { setPowerOpen(true); return; }
     if (app.screen) setScreen(app.screen);
   }, []);
 
@@ -1417,10 +1750,38 @@ export default function App() {
     }
 
     function handler(e: KeyboardEvent) {
+      // Power overlay: Ctrl+Alt+Del або Power key
+      if ((e.ctrlKey && e.altKey && e.key === "Delete") ||
+          e.key === "PowerOff" || e.key === "Power") {
+        e.preventDefault();
+        setPowerOpen(true);
+        return;
+      }
+      // Soft refresh: F5 — перечитати apps/UI з Brain без рестарту бінарника
+      if (e.key === "F5" && !e.ctrlKey && !e.shiftKey) {
+        if (document.activeElement?.tagName !== "INPUT" &&
+            document.activeElement?.tagName !== "TEXTAREA") {
+          e.preventDefault();
+          window.location.reload();
+          return;
+        }
+      }
+      // Hard refresh: Ctrl+Shift+R — рестарт бінарника ostv-ui (для нової збірки)
+      if (e.ctrlKey && e.shiftKey && (e.key === "R" || e.key === "r")) {
+        e.preventDefault();
+        invoke("brain_call", { method: "reload_ui", params: { hard: true } }).catch(() => {});
+        return;
+      }
       // AI toggle: ` або Alt+A
       if (e.key === "`" || (e.altKey && (e.key === "a" || e.key === "A"))) {
         e.preventDefault();
         setAiOpen(v => !v);
+        return;
+      }
+      // History toggle: Alt+H
+      if (e.altKey && (e.key === "h" || e.key === "H")) {
+        e.preventDefault();
+        setHistOpen(v => !v);
         return;
       }
       // Media keys — працюють глобально
@@ -1536,6 +1897,17 @@ export default function App() {
           ◉
         </div>
       )}
+      <HistorySidebar
+        open={histOpen}
+        onClose={() => setHistOpen(false)}
+        onResumed={(t) => showToast(`▶ ${t}`)}
+      />
+      {!histOpen && (
+        <div className="hist-fab" onClick={() => setHistOpen(true)} title="Alt+H — Історія перегляду">
+          ▶
+        </div>
+      )}
+      {powerOpen && <PowerOverlay onClose={() => setPowerOpen(false)} />}
       {toast && <div className="toast">{toast}</div>}
     </div>
   );

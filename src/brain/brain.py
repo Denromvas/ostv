@@ -61,6 +61,163 @@ log = logging.getLogger("brain")
 
 current_mpv: asyncio.subprocess.Process | None = None
 
+# === HISTORY ===
+import time
+import secrets
+
+HISTORY_FILE = Path("/var/lib/ostv/history.json")
+HISTORY_MAX = 200          # tail-trim
+HISTORY_FINISHED_PCT = 0.95
+current_history_id: str | None = None
+_history_tracker_task: asyncio.Task | None = None
+
+
+def _history_load() -> dict:
+    if not HISTORY_FILE.exists():
+        return {"version": 1, "items": []}
+    try:
+        with open(HISTORY_FILE) as f:
+            d = json.load(f)
+        if "items" not in d:
+            d = {"version": 1, "items": []}
+        return d
+    except Exception as e:
+        log.warning(f"history load failed: {e}")
+        return {"version": 1, "items": []}
+
+
+def _history_save(data: dict) -> None:
+    try:
+        HISTORY_FILE.parent.mkdir(parents=True, exist_ok=True)
+        tmp = HISTORY_FILE.with_suffix(".tmp")
+        with open(tmp, "w") as f:
+            json.dump(data, f, ensure_ascii=False)
+        os.replace(tmp, HISTORY_FILE)
+    except Exception as e:
+        log.warning(f"history save failed: {e}")
+
+
+def _history_create(*, title: str, source: str, original_url: str,
+                    stream_url: str | None = None, thumbnail: str | None = None,
+                    query: str | None = None, extra: dict | None = None,
+                    resume_position: float = 0.0) -> str:
+    h = _history_load()
+    hid = f"hist_{int(time.time())}_{secrets.token_hex(3)}"
+    now = int(time.time())
+    rec = {
+        "id": hid,
+        "title": title or "(без назви)",
+        "source": source,
+        "original_url": original_url,
+        "stream_url": stream_url,
+        "thumbnail": thumbnail,
+        "query": query,
+        "position_sec": float(resume_position or 0),
+        "duration_sec": 0.0,
+        "started_at": now,
+        "last_watched": now,
+        "finished": False,
+        "extra": extra or {},
+    }
+    # Прибираємо дубль того самого original_url якщо є — оновимо через resume замість
+    items = [it for it in h["items"] if it.get("original_url") != original_url]
+    items.insert(0, rec)
+    h["items"] = items[:HISTORY_MAX]
+    _history_save(h)
+    log.info(f"history: created {hid} '{title[:40]}' src={source}")
+    return hid
+
+
+def _history_update_position(hid: str, position: float, duration: float = 0.0) -> None:
+    if not hid:
+        return
+    h = _history_load()
+    found = False
+    for it in h["items"]:
+        if it["id"] == hid:
+            it["position_sec"] = float(position)
+            if duration > 0:
+                it["duration_sec"] = float(duration)
+            it["last_watched"] = int(time.time())
+            if duration > 0 and position / duration >= HISTORY_FINISHED_PCT:
+                it["finished"] = True
+            found = True
+            break
+    if found:
+        _history_save(h)
+
+
+def _history_get(hid: str) -> dict | None:
+    h = _history_load()
+    for it in h["items"]:
+        if it["id"] == hid:
+            return it
+    return None
+
+
+async def _mpv_query(prop: str) -> float | None:
+    """Запит властивості mpv через IPC. Повертає float або None."""
+    sock_path = "/run/ostv/mpv.sock"
+    if not os.path.exists(sock_path):
+        return None
+    try:
+        reader, writer = await asyncio.open_unix_connection(sock_path)
+        req = json.dumps({"command": ["get_property", prop]}) + "\n"
+        writer.write(req.encode())
+        await writer.drain()
+        line = await asyncio.wait_for(reader.readline(), timeout=1.5)
+        writer.close()
+        try:
+            await writer.wait_closed()
+        except Exception:
+            pass
+        d = json.loads(line)
+        if d.get("error") == "success":
+            v = d.get("data")
+            return float(v) if v is not None else None
+    except Exception:
+        return None
+    return None
+
+
+async def _history_track_loop():
+    """Бекграунд-поллінг mpv time-pos/duration → пише в активний history record."""
+    global current_history_id
+    log.info("history tracker: started")
+    try:
+        while True:
+            await asyncio.sleep(3)
+            if not current_history_id:
+                continue
+            if not current_mpv or current_mpv.returncode is not None:
+                continue
+            pos = await _mpv_query("time-pos")
+            dur = await _mpv_query("duration")
+            if pos is not None and pos > 0:
+                _history_update_position(current_history_id, pos, dur or 0)
+    except asyncio.CancelledError:
+        log.info("history tracker: cancelled")
+        raise
+    except Exception as e:
+        log.error(f"history tracker crashed: {e}")
+
+
+def _history_ensure_tracker():
+    global _history_tracker_task
+    if _history_tracker_task is None or _history_tracker_task.done():
+        _history_tracker_task = asyncio.create_task(_history_track_loop())
+
+
+async def _history_finalize(hid: str):
+    """Викликається після exit mpv: фіксує фінальну позицію."""
+    if not hid:
+        return
+    pos = await _mpv_query("time-pos")  # zazvychay None бо mpv mert
+    if pos is not None:
+        _history_update_position(hid, pos)
+    # mark finished is handled by update_position when pos/dur >= 95%
+    log.info(f"history: finalized {hid}")
+
 
 async def _restore_focus():
     try:
@@ -81,8 +238,12 @@ async def _restore_focus():
 
 
 async def _watch_mpv_exit(proc: asyncio.subprocess.Process):
+    global current_history_id
     await proc.wait()
     log.info(f"mpv (pid={proc.pid}) exited rc={proc.returncode}")
+    if current_history_id:
+        await _history_finalize(current_history_id)
+        current_history_id = None
     await _restore_focus()
 
 
@@ -115,18 +276,40 @@ async def _kill_mpv():
             await current_mpv.wait()
 
 
-async def tool_play_url(url: str, fullscreen: bool = True, quality: str = "1080p") -> dict:
-    global current_mpv
+async def tool_play_url(url: str, fullscreen: bool = True, quality: str = "1080p",
+                        title: str | None = None, source: str | None = None,
+                        thumbnail: str | None = None, query: str | None = None,
+                        resume_position: float = 0.0) -> dict:
+    global current_mpv, current_history_id
+
+    original_url = url  # запам'ятовуємо ВХІДНИЙ url — для resume HDRezka сторінки
+    extra: dict = {}
 
     # Auto-detect HDRezka film page URL → extract stream first
     is_hdrezka = any(host in url for host in ("rezka.ag", "hdrezka.ag", "hdrezka.cc"))
-    if is_hdrezka and "/films/" in url or (is_hdrezka and "/series/" in url):
+    if (is_hdrezka and "/films/" in url) or (is_hdrezka and "/series/" in url):
         log.info(f"play_url: auto-extracting HDRezka → {url}")
         ex = await tool_extract_hdrezka(url=url, quality=quality)
         if not ex.get("ok"):
             return ex
         url = ex["url"]
+        if not source:
+            source = "hdrezka"
+        if not title and ex.get("title"):
+            title = ex["title"]
+        extra["quality"] = ex.get("quality") or quality
+        if ex.get("translator_id") is not None:
+            extra["translator_id"] = ex["translator_id"]
         log.info(f"extracted stream: {url[:80]}")
+
+    # Auto-detect YouTube
+    if not source:
+        if any(h in original_url for h in ("youtube.com", "youtu.be")):
+            source = "youtube"
+        elif original_url.startswith("/") or original_url.startswith("file://"):
+            source = "local"
+        else:
+            source = "direct"
 
     await _kill_mpv()
 
@@ -147,8 +330,11 @@ async def tool_play_url(url: str, fullscreen: bool = True, quality: str = "1080p
         "--input-ipc-server=/run/ostv/mpv.sock",
         "--msg-level=all=warn",
         "--keep-open=no",                 # exit одразу після EOF
-        url,
     ]
+    if resume_position and resume_position > 5:
+        cmd.append(f"--start={int(resume_position)}")
+    cmd.append(url)
+
     log.info(f"Starting mpv: {url[:80]}")
     current_mpv = await asyncio.create_subprocess_exec(
         *cmd, env=env,
@@ -156,11 +342,28 @@ async def tool_play_url(url: str, fullscreen: bool = True, quality: str = "1080p
         stderr=asyncio.subprocess.DEVNULL,
     )
     asyncio.create_task(_watch_mpv_exit(current_mpv))
-    return {"ok": True, "pid": current_mpv.pid, "url": url}
+
+    # History entry — створюємо завжди (навіть з placeholder title)
+    current_history_id = _history_create(
+        title=title or original_url[-60:],
+        source=source,
+        original_url=original_url,
+        stream_url=url,
+        thumbnail=thumbnail,
+        query=query,
+        extra=extra,
+        resume_position=resume_position,
+    )
+    _history_ensure_tracker()
+
+    return {"ok": True, "pid": current_mpv.pid, "url": url, "history_id": current_history_id}
 
 
-async def tool_play_youtube(url: str, fullscreen: bool = True) -> dict:
-    return await tool_play_url(url=url, fullscreen=fullscreen)
+async def tool_play_youtube(url: str, fullscreen: bool = True,
+                            title: str | None = None, thumbnail: str | None = None,
+                            query: str | None = None) -> dict:
+    return await tool_play_url(url=url, fullscreen=fullscreen, source="youtube",
+                               title=title, thumbnail=thumbnail, query=query)
 
 
 async def tool_stop() -> dict:
@@ -1042,6 +1245,226 @@ async def tool_mpv_control(action: str) -> dict:
         return {"ok": False, "error": str(e)}
 
 
+async def tool_history_list(limit: int = 50, include_finished: bool = True) -> dict:
+    """Список історії перегляду (новіші перші). include_finished=False приховує >95% переглянуті."""
+    h = _history_load()
+    items = h.get("items", [])
+    if not include_finished:
+        items = [it for it in items if not it.get("finished")]
+    items = sorted(items, key=lambda it: it.get("last_watched", 0), reverse=True)
+    return {"ok": True, "items": items[:limit], "total": len(h.get("items", []))}
+
+
+async def tool_history_get(id: str) -> dict:
+    rec = _history_get(id)
+    if not rec:
+        return {"ok": False, "error": "not found"}
+    return {"ok": True, "item": rec}
+
+
+async def tool_history_resume(id: str, fullscreen: bool = True) -> dict:
+    """Відновлює перегляд: re-extract URL якщо треба + mpv --start=position."""
+    rec = _history_get(id)
+    if not rec:
+        return {"ok": False, "error": "not found"}
+    pos = float(rec.get("position_sec", 0) or 0)
+    # якщо переглянуто — починаємо з нуля
+    if rec.get("finished"):
+        pos = 0
+    src = rec.get("source", "direct")
+    orig = rec.get("original_url")
+    title = rec.get("title")
+    thumb = rec.get("thumbnail")
+    query = rec.get("query")
+    extra = rec.get("extra") or {}
+    quality = extra.get("quality") or "1080p"
+
+    if src == "hdrezka":
+        # Передаємо ОРИГІНАЛЬНИЙ page URL — play_url сам re-extract'не свіжий потік
+        return await tool_play_url(
+            url=orig, fullscreen=fullscreen, quality=quality,
+            title=title, source="hdrezka", thumbnail=thumb,
+            query=query, resume_position=pos,
+        )
+    elif src == "youtube":
+        return await tool_play_url(
+            url=orig, fullscreen=fullscreen,
+            title=title, source="youtube", thumbnail=thumb,
+            query=query, resume_position=pos,
+        )
+    elif src in ("local", "direct"):
+        return await tool_play_url(
+            url=orig, fullscreen=fullscreen,
+            title=title, source=src, thumbnail=thumb,
+            query=query, resume_position=pos,
+        )
+    else:
+        return {"ok": False, "error": f"unknown source: {src}"}
+
+
+async def tool_history_remove(id: str) -> dict:
+    h = _history_load()
+    n0 = len(h["items"])
+    h["items"] = [it for it in h["items"] if it["id"] != id]
+    if len(h["items"]) == n0:
+        return {"ok": False, "error": "not found"}
+    _history_save(h)
+    return {"ok": True, "removed": id}
+
+
+async def tool_history_clear(only_finished: bool = False) -> dict:
+    h = _history_load()
+    if only_finished:
+        kept = [it for it in h["items"] if not it.get("finished")]
+        removed = len(h["items"]) - len(kept)
+        h["items"] = kept
+    else:
+        removed = len(h["items"])
+        h["items"] = []
+    _history_save(h)
+    return {"ok": True, "removed": removed}
+
+
+async def tool_update_check() -> dict:
+    """Перевірити чи є новіша версія OsTv на GitHub. Не ставить нічого."""
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            "sudo", "-n", "/opt/ostv/scripts/update.sh", "--check",
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=30)
+        out = stdout.decode(errors="ignore")
+        # Витягуємо останній рядок-JSON
+        last_json = None
+        for line in out.strip().split("\n")[::-1]:
+            line = line.strip()
+            if line.startswith("{") and line.endswith("}"):
+                try:
+                    last_json = json.loads(line)
+                    break
+                except json.JSONDecodeError:
+                    continue
+        if last_json:
+            return last_json
+        return {"ok": False, "error": "no JSON output", "stderr": stderr.decode(errors="ignore")[:200]}
+    except asyncio.TimeoutError:
+        return {"ok": False, "error": "timeout"}
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
+
+async def tool_update_apply(force: bool = False) -> dict:
+    """Запустити апдейт OsTv до latest з GitHub. Detached — UI рестартує сам."""
+    args = ["sudo", "-n", "/opt/ostv/scripts/update.sh"]
+    if force:
+        args.append("--force")
+    log.info(f"update_apply: {' '.join(args)}")
+    try:
+        # Detached щоб ми не залежали від цього процесу
+        await asyncio.create_subprocess_exec(
+            "setsid", "bash", "-c",
+            f"nohup {' '.join(args)} >>/var/log/ostv-update.log 2>&1 &",
+            stdout=asyncio.subprocess.DEVNULL,
+            stderr=asyncio.subprocess.DEVNULL,
+            start_new_session=True,
+        )
+        return {"ok": True, "started": True,
+                "note": "оновлення триває — лог /var/log/ostv-update.log; UI рестартує сам"}
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
+
+async def tool_power(action: str = "reboot") -> dict:
+    """Power-керування. action: reboot | shutdown | suspend | logout"""
+    valid = {"reboot", "shutdown", "poweroff", "suspend", "logout"}
+    action = action.lower()
+    if action not in valid:
+        return {"ok": False, "error": f"unknown action: {action} (expected one of {valid})"}
+
+    if action == "reboot":
+        cmd = ["sudo", "-n", "/usr/bin/systemctl", "reboot"]
+    elif action in ("shutdown", "poweroff"):
+        cmd = ["sudo", "-n", "/usr/bin/systemctl", "poweroff"]
+    elif action == "suspend":
+        cmd = ["sudo", "-n", "/usr/bin/systemctl", "suspend"]
+    elif action == "logout":
+        cmd = ["pkill", "-TERM", "-u", "tv", "openbox-session"]
+
+    log.info(f"POWER: {action} → {' '.join(cmd)}")
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            *cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        try:
+            stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=5)
+        except asyncio.TimeoutError:
+            # Power дія почалась — машина завершується
+            return {"ok": True, "action": action, "note": "executing"}
+        if proc.returncode != 0:
+            return {"ok": False, "action": action,
+                    "error": stderr.decode(errors="ignore")[:200]}
+        return {"ok": True, "action": action}
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
+
+async def tool_reload_ui(hard: bool = True) -> dict:
+    """Перезапуск UI. hard=True: kill+detached relaunch ostv-ui (для нової збірки бінарника).
+       hard=False: підказка клієнту що треба window.location.reload() — фронт сам це робить."""
+    if not hard:
+        return {"ok": True, "soft": True, "hint": "client should window.location.reload()"}
+
+    disp, auth = _detect_xauth()
+    auth_line = f"export XAUTHORITY={auth}\n" if auth else ""
+    relaunch = "/tmp/ostv-relaunch.sh"
+    script = f"""#!/bin/bash
+sleep 1
+export DISPLAY={disp}
+{auth_line}export XDG_RUNTIME_DIR=/run/user/$(id -u tv)
+export GDK_DEBUG=gl-disable
+export WEBKIT_DISABLE_COMPOSITING_MODE=1
+export WEBKIT_DISABLE_DMABUF_RENDERER=1
+export LIBGL_ALWAYS_SOFTWARE=1
+export MESA_LOADER_DRIVER_OVERRIDE=llvmpipe
+exec /opt/ostv/bin/ostv-ui >/home/tv/.local/share/ostv/ui-reload.log 2>&1
+"""
+    try:
+        with open(relaunch, "w") as f:
+            f.write(script)
+        os.chmod(relaunch, 0o755)
+    except Exception as e:
+        return {"ok": False, "error": f"write relaunch script: {e}"}
+
+    # Detached spawn — survives parent (Brain) і не вмирає при kill старого UI
+    log.info(f"reload_ui: spawning detached relaunch script {relaunch}")
+    try:
+        await asyncio.create_subprocess_exec(
+            "setsid", "bash", "-c", f"nohup {relaunch} >/dev/null 2>&1 &",
+            stdout=asyncio.subprocess.DEVNULL,
+            stderr=asyncio.subprocess.DEVNULL,
+            start_new_session=True,
+        )
+    except Exception as e:
+        return {"ok": False, "error": f"spawn detached: {e}"}
+
+    # Дамо дочірньому встигнути від'єднатись
+    await asyncio.sleep(0.3)
+    # Вбиваємо поточний UI
+    log.info("reload_ui: killing current ostv-ui")
+    try:
+        await asyncio.create_subprocess_exec(
+            "pkill", "-9", "-f", "/opt/ostv/bin/ostv-ui",
+            stdout=asyncio.subprocess.DEVNULL,
+            stderr=asyncio.subprocess.DEVNULL,
+        )
+    except Exception as e:
+        return {"ok": True, "warning": f"pkill failed: {e}"}
+    return {"ok": True, "hard": True, "note": "ui restart in ~1s"}
+
+
 async def tool_launch_terminal(shell: str = "bash") -> dict:
     """Запускає xterm fullscreen з bash. При exit — фокус повертається на OsTv."""
     env = os.environ.copy()
@@ -1222,6 +1645,15 @@ TOOLS = {
     "search_all": tool_search_all,
     "kbd_layout": tool_kbd_layout,
     "volume": tool_volume,
+    "power": tool_power,
+    "reload_ui": tool_reload_ui,
+    "history_list": tool_history_list,
+    "history_get": tool_history_get,
+    "history_resume": tool_history_resume,
+    "history_remove": tool_history_remove,
+    "history_clear": tool_history_clear,
+    "update_check": tool_update_check,
+    "update_apply": tool_update_apply,
     "list_files": tool_list_files,
     "play_playlist": tool_play_playlist,
     "mpv_control": tool_mpv_control,

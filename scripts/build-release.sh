@@ -76,8 +76,10 @@ CLOSE_WIN quit
 MBTN_MID  quit
 EOF
 
-echo "=== 7. Install script ==="
+echo "=== 7. Install script + updater ==="
 cp "$OSTV_SRC/scripts/install-ostv.sh" "$RELEASE/install.sh"
+cp "$OSTV_SRC/scripts/update.sh"       "$RELEASE/update.sh"
+chmod +x "$RELEASE/install.sh" "$RELEASE/update.sh"
 
 echo "=== 8. Manifest ==="
 cat > "$RELEASE/MANIFEST.txt" <<EOF
