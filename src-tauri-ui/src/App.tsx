@@ -1021,6 +1021,8 @@ function SettingsScreen({ onBack, settings, onChange }: {
   const [apps, setApps] = useState<any[]>([]);
   const [updateInfo, setUpdateInfo] = useState<string>("(не перевірено)");
   const [updating, setUpdating] = useState(false);
+  const [aiStatus, setAiStatus] = useState<string>("?");
+  const [aiTesting, setAiTesting] = useState(false);
 
   const reloadApps = useCallback(async () => {
     try {
@@ -1038,22 +1040,53 @@ function SettingsScreen({ onBack, settings, onChange }: {
     } catch {}
   }, [reloadApps]);
 
+  const refreshAiStatus = useCallback(async () => {
+    try {
+      const r = await invoke<any>("brain_call", { method: "ai_status", params: {} });
+      const v = r?.result;
+      if (!v) { setAiStatus("offline"); return; }
+      if (v.preferred === "claude-cli" && v.claude_cli && v.claude_cli_auth) {
+        setAiStatus(`✓ claude CLI · ${v.model}`);
+        setApiKeyStatus("✓ OAuth (claude CLI)");
+      } else if (v.preferred === "anthropic-sdk" && v.anthropic_key) {
+        setAiStatus(`✓ Anthropic API · ${v.model}`);
+        setApiKeyStatus("✓ API key");
+      } else if (v.claude_cli && !v.claude_cli_auth) {
+        setAiStatus(`⚠ claude CLI без auth — тицьни Reauth`);
+        setApiKeyStatus("✗ OAuth не пройдений");
+      } else {
+        setAiStatus("✗ AI не налаштовано");
+        setApiKeyStatus("✗ нема ні OAuth ні API key");
+      }
+    } catch { setAiStatus("offline"); }
+  }, []);
+
+  const aiTest = useCallback(async () => {
+    setAiTesting(true);
+    setAiStatus("тестую...");
+    try {
+      const r = await invoke<any>("brain_call", { method: "ai_test", params: {} });
+      const v = r?.result;
+      if (v?.ok) setAiStatus(`✓ ${v.latency_ms}ms · ${v.reply || "ok"}`);
+      else setAiStatus(`✗ ${v?.error || "fail"}`);
+    } catch (e) { setAiStatus(`✗ ${e}`); }
+    finally { setAiTesting(false); }
+  }, []);
+
+  const aiReauth = useCallback(async () => {
+    if (!confirm("Запустити OAuth-логін Claude у термінал? У ньому набери /login.")) return;
+    try {
+      await invoke<any>("brain_call", { method: "ai_reauth", params: { provider: "claude_cli" } });
+      setAiStatus("⏳ термінал відкрито, після /login натисни «Test»");
+    } catch (e) { setAiStatus(`✗ ${e}`); }
+  }, []);
+
   useEffect(() => {
     invoke<any>("brain_call", { method: "ping", params: {} })
       .then((r) => setBrainVersion(r?.result?.version || "?"))
       .catch(() => setBrainVersion("offline"));
-    // Test AI (spawn тільки ping, не реальне спілкування)
-    invoke<any>("brain_call", {
-      method: "ai_chat",
-      params: { messages: [{ role: "user", content: "ping" }] },
-    })
-      .then((r) => {
-        if (r?.result?.ok) setApiKeyStatus("✓ встановлено");
-        else if (r?.result?.error?.includes("ANTHROPIC_API_KEY")) setApiKeyStatus("✗ не встановлено");
-        else setApiKeyStatus(`? ${r?.result?.error?.slice(0, 40)}`);
-      })
-      .catch(() => setApiKeyStatus("offline"));
-  }, []);
+    refreshAiStatus();
+  }, [refreshAiStatus]);
 
   const checkUpdate = useCallback(async () => {
     setUpdateInfo("перевіряю...");
@@ -1092,6 +1125,10 @@ function SettingsScreen({ onBack, settings, onChange }: {
         onChange({ ...settings, theme: order[(idx + 1) % order.length] });
       } },
     { label: "Brain version", value: brainVersion, onToggle: () => {} },
+    { label: "AI status", value: aiStatus,
+      onToggle: () => { if (!aiTesting) aiTest(); } },
+    { label: "AI reauth (Claude CLI)", value: "→ /login в xterm",
+      onToggle: aiReauth },
     { label: "Anthropic API key", value: apiKeyStatus, onToggle: () => {} },
     { label: "OsTv updates", value: updateInfo,
       onToggle: () => {
@@ -1308,7 +1345,10 @@ interface ChatMessage {
   role: "user" | "assistant";
   content: string;
   actions?: any[];
+  needsAuth?: boolean;   // показати кнопку «Перепідключитись»
 }
+
+const AUTH_ERROR_PATTERNS = /401|403|auth|credential|unauthorized|api.?key|оаuth|ANTHROPIC_API_KEY|claude.cli|оauth|invalid.token|not.logged/i;
 
 // ============ History Sidebar (left) ============
 type HistItem = {
@@ -1538,17 +1578,41 @@ function AiChatSidebar({ open, onClose }: { open: boolean; onClose: () => void }
           actions: r.actions,
         }]);
       } else {
+        const err = r?.error || resp?.error || "помилка";
+        const needsAuth = AUTH_ERROR_PATTERNS.test(String(err));
         setMessages([...newMsgs, {
           role: "assistant",
-          content: `✗ ${r?.error || resp?.error || "помилка"}`,
+          content: `✗ ${err}`,
+          needsAuth,
         }]);
       }
     } catch (e) {
-      setMessages([...newMsgs, { role: "assistant", content: `✗ ${e}` }]);
+      const msg = String(e);
+      setMessages([...newMsgs, {
+        role: "assistant",
+        content: `✗ ${msg}`,
+        needsAuth: AUTH_ERROR_PATTERNS.test(msg),
+      }]);
     } finally {
       setLoading(false);
     }
   }, [input, messages, loading]);
+
+  const reauthFromChat = useCallback(async () => {
+    if (!confirm("Запустити OAuth-логін Claude у термінал? Введи /login там і завершуй логін.")) return;
+    try {
+      const r = await invoke<any>("brain_call", { method: "ai_reauth", params: { provider: "claude_cli" } });
+      const v = r?.result;
+      setMessages(m => [...m, {
+        role: "assistant",
+        content: v?.ok
+          ? `⏳ ${v.note || "термінал відкрито — заверши логін, потім спробуй запит знов."}`
+          : `✗ ${v?.error || "не вдалось"}`,
+      }]);
+    } catch (e) {
+      setMessages(m => [...m, { role: "assistant", content: `✗ ${e}` }]);
+    }
+  }, []);
 
   const handleKey = useCallback((e: React.KeyboardEvent<HTMLTextAreaElement>) => {
     if (e.key === "Enter" && !e.shiftKey) {
@@ -1596,6 +1660,14 @@ function AiChatSidebar({ open, onClose }: { open: boolean; onClose: () => void }
                     🔧 {a.name}({a.result_summary || "..."})
                   </div>
                 ))}
+              </div>
+            )}
+            {m.needsAuth && (
+              <div className="ai-actions" style={{ borderTop: "1px solid #c01c28" }}>
+                <button className="ai-send" style={{ background: "#41ff7a", padding: "6px 14px", marginTop: 6 }}
+                        onClick={reauthFromChat}>
+                  ↻ ПЕРЕПІДКЛЮЧИТИСЬ
+                </button>
               </div>
             )}
           </div>

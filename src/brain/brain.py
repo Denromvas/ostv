@@ -1325,6 +1325,102 @@ async def tool_history_clear(only_finished: bool = False) -> dict:
     return {"ok": True, "removed": removed}
 
 
+async def tool_ai_status() -> dict:
+    """Швидкий health-check AI підсистеми. Повертає статус кожного backend без виклику моделі."""
+    out = {"ok": True, "claude_cli": False, "anthropic_sdk": False, "anthropic_key": False, "preferred": None}
+    # claude CLI installed?
+    if os.path.exists("/usr/bin/claude"):
+        out["claude_cli"] = True
+        # Перевіримо OAuth credentials у tv home
+        cred = "/home/tv/.claude/.credentials.json"
+        try:
+            if os.path.exists(cred) and os.path.getsize(cred) > 50:
+                out["claude_cli_auth"] = True
+            else:
+                out["claude_cli_auth"] = False
+        except Exception:
+            out["claude_cli_auth"] = False
+    # Anthropic SDK?
+    if ANTHROPIC_AVAILABLE:
+        out["anthropic_sdk"] = True
+    # API key present?
+    if _load_anthropic_key():
+        out["anthropic_key"] = True
+
+    # Preferred backend (за дефолтом — claude-cli якщо живий+autorized)
+    preferred = os.environ.get("OSTV_AI_BACKEND")
+    if not preferred:
+        if out["claude_cli"] and out.get("claude_cli_auth"):
+            preferred = "claude-cli"
+        elif out["anthropic_sdk"] and out["anthropic_key"]:
+            preferred = "anthropic-sdk"
+        else:
+            preferred = "none"
+    out["preferred"] = preferred
+    out["healthy"] = preferred != "none"
+    out["model"] = CLAUDE_MODEL
+    return out
+
+
+async def tool_ai_test(backend: str | None = None) -> dict:
+    """Real ping до моделі: відправляє "ping" і чекає короткої відповіді. Latency у мс."""
+    import time as _time
+    t0 = _time.time()
+    try:
+        r = await asyncio.wait_for(
+            tool_ai_chat(messages=[{"role": "user", "content": "respond exactly: pong"}],
+                         backend=backend),
+            timeout=30,
+        )
+    except asyncio.TimeoutError:
+        return {"ok": False, "error": "timeout 30s", "latency_ms": int((_time.time()-t0)*1000)}
+    dt = int((_time.time()-t0)*1000)
+    if not r.get("ok"):
+        return {"ok": False, "error": r.get("error", "?"), "latency_ms": dt,
+                "backend": r.get("backend") or backend}
+    reply = (r.get("reply") or "").strip()
+    return {"ok": True, "latency_ms": dt, "reply": reply[:60],
+            "backend": r.get("backend") or backend, "model": r.get("model") or CLAUDE_MODEL}
+
+
+async def tool_ai_reauth(provider: str = "claude_cli") -> dict:
+    """Re-authentication flow.
+    - claude_cli: запускає xterm з 'claude' (юзер виконує OAuth login в браузері)
+    - anthropic-sdk: повертає інструкцію — ключ ставиться в Settings → API key
+    """
+    if provider == "claude_cli":
+        env = os.environ.copy()
+        disp, auth = _detect_xauth()
+        env["DISPLAY"] = disp
+        if auth:
+            env["XAUTHORITY"] = auth
+        # запускаємо xterm з claude → юзер сам логиниться
+        cmd = [
+            "xterm", "-fa", "JetBrains Mono", "-fs", "14", "-fullscreen",
+            "-bg", "#000000", "-fg", "#41ff7a",
+            "-title", "OsTv — Claude Reauth",
+            "-e", "/usr/bin/claude",
+        ]
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                *cmd, env=env,
+                stdout=asyncio.subprocess.DEVNULL,
+                stderr=asyncio.subprocess.DEVNULL,
+            )
+            asyncio.create_task(_watch_xterm_exit(proc))
+            return {"ok": True, "pid": proc.pid,
+                    "note": "у термінал введи /login та слідуй інструкціям OAuth"}
+        except FileNotFoundError:
+            return {"ok": False, "error": "xterm не встановлений"}
+        except Exception as e:
+            return {"ok": False, "error": str(e)}
+    elif provider in ("anthropic-sdk", "claude_api", "anthropic"):
+        return {"ok": False,
+                "note": "API key reauth вручну — у Settings → Anthropic API key, або "
+                        "echo 'ANTHROPIC_API_KEY=sk-ant-...' >> /etc/ostv/secrets.env"}
+    return {"ok": False, "error": f"unknown provider: {provider}"}
+
+
 async def tool_update_check() -> dict:
     """Перевірити чи є новіша версія OsTv на GitHub. Не ставить нічого."""
     try:
@@ -1659,6 +1755,9 @@ TOOLS = {
     "mpv_control": tool_mpv_control,
     "launch_terminal": tool_launch_terminal,
     "ai_chat": tool_ai_chat,
+    "ai_status": tool_ai_status,
+    "ai_test": tool_ai_test,
+    "ai_reauth": tool_ai_reauth,
     "list_apps": tool_list_apps,
     "propose_module": tool_propose_module,
     "approve_module": tool_approve_module,
