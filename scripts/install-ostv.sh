@@ -24,7 +24,7 @@
 
 set -e
 
-OSTV_VERSION="${OSTV_VERSION:-0.1.2}"
+OSTV_VERSION="${OSTV_VERSION:-0.1.3}"
 RELEASE_URL="${RELEASE_URL:-https://denromvas.website/ostv/ostv-release-v${OSTV_VERSION}.tar.gz}"
 LOCAL_TARBALL=""
 SKIP_KIOSK=0
@@ -117,12 +117,18 @@ fi
 getent group ostv >/dev/null || groupadd --system ostv
 usermod -g ostv ostv 2>/dev/null || true
 
+TV_USER_NEW=0
 if ! id tv >/dev/null 2>&1; then
     useradd --uid 1500 --create-home --shell /bin/bash \
             --comment "OsTv kiosk" tv
+    TV_USER_NEW=1
 fi
 usermod -aG ostv,video,audio,input,render tv 2>/dev/null || true
-passwd -d tv
+# passwd -d тільки на свіжій інсталяції — апгрейди не повинні зривати ssh login юзеру tv,
+# який юзер міг встановити вручну (сloud-init seed або post-install passwd)
+if [ "$TV_USER_NEW" = "1" ]; then
+    passwd -d tv
+fi
 
 # ---- 4. Layout ----
 echo ""
@@ -142,6 +148,12 @@ systemd-tmpfiles --create /usr/lib/tmpfiles.d/ostv.conf || true
 # ---- 5. Copy release content ----
 echo ""
 echo "=== 5. Deploy files ==="
+# Спершу зупиняємо запущений UI/Brain, інакше cp на ostv-ui дає "Text file busy"
+pkill -9 -f /opt/ostv/bin/ostv-ui 2>/dev/null || true
+systemctl stop ostv-brain.service 2>/dev/null || true
+sleep 1
+rm -f /opt/ostv/bin/ostv-ui   # звільняємо inode (на випадок exec'd file)
+
 cp -r "$RELEASE_ROOT/brain/"* /opt/ostv/brain/
 cp -r "$RELEASE_ROOT/parsers/"* /opt/ostv/parsers/
 cp -r "$RELEASE_ROOT/bin/"* /opt/ostv/bin/
