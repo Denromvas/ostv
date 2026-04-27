@@ -24,7 +24,7 @@
 
 set -e
 
-OSTV_VERSION="${OSTV_VERSION:-0.1.3}"
+OSTV_VERSION="${OSTV_VERSION:-0.1.4}"
 RELEASE_URL="${RELEASE_URL:-https://denromvas.website/ostv/ostv-release-v${OSTV_VERSION}.tar.gz}"
 LOCAL_TARBALL=""
 SKIP_KIOSK=0
@@ -168,11 +168,24 @@ fi
 
 [ -f /etc/ostv/config.toml ] || cp "$RELEASE_ROOT/config/config.toml" /etc/ostv/config.toml 2>/dev/null || true
 [ -f /etc/ostv/secrets.env ] || cat > /etc/ostv/secrets.env <<EOF
-# OsTv secrets. chmod 0600. Вставте Claude/Anthropic API key тут:
+# OsTv secrets. group-writable (root:ostv 0660) для ai_set_provider tool.
+# Можна також редагувати руками:
 # ANTHROPIC_API_KEY=sk-ant-...
+# OPENAI_API_KEY=sk-...
+# GEMINI_API_KEY=AIza...
+# OPENROUTER_API_KEY=sk-or-...
 EOF
-chmod 0600 /etc/ostv/secrets.env
 chown root:ostv /etc/ostv/secrets.env
+chmod 0660 /etc/ostv/secrets.env
+
+# AI config (TOML). Group-writable, щоб ai_set_provider міг змінювати.
+[ -f /etc/ostv/ai.conf ] || cat > /etc/ostv/ai.conf <<EOF
+[ai]
+provider = "claude_cli"
+model = "claude-haiku-4-5"
+EOF
+chown root:ostv /etc/ostv/ai.conf
+chmod 0664 /etc/ostv/ai.conf
 
 chmod +x /opt/ostv/bin/ostv-ui /opt/ostv/bin/brain.sh 2>/dev/null || true
 chmod +x /opt/ostv/parsers/*/parser.py /opt/ostv/parsers/*/*.py 2>/dev/null || true

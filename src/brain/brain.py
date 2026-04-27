@@ -500,21 +500,135 @@ AI_SYSTEM_PROMPT = """Ти — AI-агент у OsTv, домашній ТВ-оп
 """
 
 
-def _load_anthropic_key() -> str | None:
+def _load_secret(key: str) -> str | None:
     """Читає ключ з env або /etc/ostv/secrets.env"""
-    k = os.environ.get("ANTHROPIC_API_KEY")
-    if k:
-        return k
+    v = os.environ.get(key)
+    if v:
+        return v
     try:
         with open("/etc/ostv/secrets.env") as f:
             for line in f:
                 line = line.strip()
-                if line.startswith("ANTHROPIC_API_KEY="):
+                if line.startswith(f"{key}="):
                     v = line.split("=", 1)[1].strip().strip('"').strip("'")
                     return v or None
     except Exception:
         return None
     return None
+
+
+def _load_anthropic_key() -> str | None:
+    return _load_secret("ANTHROPIC_API_KEY")
+
+
+# ============================================================
+#  AI PROVIDER CONFIG
+# ============================================================
+
+AI_CONF_PATH = "/etc/ostv/ai.conf"
+
+# default моделі для кожного провайдера
+DEFAULT_MODELS = {
+    "claude_cli":  "claude-haiku-4-5",
+    "claude_api":  "claude-haiku-4-5",
+    "openai":      "gpt-4o-mini",
+    "gemini":      "gemini-2.0-flash",
+    "openrouter":  "anthropic/claude-haiku-4-5",
+    "ollama":      "qwen2.5:3b",
+}
+
+# дефолтні base_url (тільки де треба)
+DEFAULT_BASE_URLS = {
+    "openai":     "https://api.openai.com/v1",
+    "openrouter": "https://openrouter.ai/api/v1",
+    "ollama":     "http://localhost:11434",
+}
+
+# мапа secret-keys для кожного провайдера
+PROVIDER_KEY_NAME = {
+    "claude_api":  "ANTHROPIC_API_KEY",
+    "openai":      "OPENAI_API_KEY",
+    "gemini":      "GEMINI_API_KEY",
+    "openrouter":  "OPENROUTER_API_KEY",
+    # claude_cli і ollama — без ключа
+}
+
+
+def _load_ai_config() -> dict:
+    """Читає /etc/ostv/ai.conf (TOML). Якщо нема — дефолт claude_cli."""
+    cfg = {"provider": "claude_cli", "model": DEFAULT_MODELS["claude_cli"], "base_url": None}
+    try:
+        try:
+            import tomllib  # py3.11+
+        except ImportError:
+            import tomli as tomllib  # type: ignore
+        with open(AI_CONF_PATH, "rb") as f:
+            data = tomllib.load(f)
+        ai = data.get("ai", {}) if isinstance(data, dict) else {}
+        prov = ai.get("provider", "claude_cli")
+        if prov not in DEFAULT_MODELS:
+            log.warning(f"unknown provider '{prov}' in ai.conf — fallback claude_cli")
+            prov = "claude_cli"
+        cfg["provider"] = prov
+        cfg["model"] = ai.get("model", DEFAULT_MODELS[prov])
+        cfg["base_url"] = ai.get("base_url") or DEFAULT_BASE_URLS.get(prov)
+    except FileNotFoundError:
+        # back-compat — env-змінна або дефолт
+        prov = os.environ.get("OSTV_AI_BACKEND", "claude_cli")
+        if prov == "claude-cli":
+            prov = "claude_cli"
+        elif prov == "anthropic-sdk":
+            prov = "claude_api"
+        if prov in DEFAULT_MODELS:
+            cfg["provider"] = prov
+            cfg["model"] = DEFAULT_MODELS[prov]
+            cfg["base_url"] = DEFAULT_BASE_URLS.get(prov)
+    except Exception as e:
+        log.warning(f"ai.conf parse error: {e}")
+    return cfg
+
+
+def _save_ai_config(provider: str, model: str | None = None, base_url: str | None = None) -> None:
+    """Пише /etc/ostv/ai.conf з мінімальним TOML."""
+    if provider not in DEFAULT_MODELS:
+        raise ValueError(f"unknown provider: {provider}")
+    model = model or DEFAULT_MODELS[provider]
+    base_url = base_url or DEFAULT_BASE_URLS.get(provider) or ""
+    lines = ["[ai]\n", f'provider = "{provider}"\n', f'model = "{model}"\n']
+    if base_url:
+        lines.append(f'base_url = "{base_url}"\n')
+    try:
+        with open(AI_CONF_PATH, "w") as f:
+            f.writelines(lines)
+        log.info(f"ai.conf saved: provider={provider} model={model}")
+    except PermissionError:
+        log.warning(f"cannot write {AI_CONF_PATH} (no permission)")
+        raise
+
+
+def _save_secret(key: str, value: str) -> None:
+    """Атомарно вписує/оновлює key=value у /etc/ostv/secrets.env."""
+    path = "/etc/ostv/secrets.env"
+    lines: list[str] = []
+    found = False
+    try:
+        with open(path) as f:
+            for line in f:
+                if line.startswith(f"{key}="):
+                    lines.append(f'{key}={value}\n')
+                    found = True
+                else:
+                    lines.append(line)
+    except FileNotFoundError:
+        pass
+    if not found:
+        lines.append(f'{key}={value}\n')
+    tmp = path + ".tmp"
+    with open(tmp, "w") as f:
+        f.writelines(lines)
+    os.chmod(tmp, 0o600)
+    os.replace(tmp, path)
+    log.info(f"secret saved: {key}=*** ({len(value)} chars)")
 
 
 CLAUDE_CLI_SYSTEM_PROMPT = """Ти — AI-агент OsTv, домашньої ТВ-ОС.
@@ -640,20 +754,164 @@ async def _ai_chat_via_cli(messages: list) -> dict:
     }
 
 
+async def _ai_chat_openai_compat(messages: list, system: str, model: str,
+                                  base_url: str, api_key: str,
+                                  provider_label: str = "openai") -> dict:
+    """OpenAI-compatible chat (працює для openai та openrouter)."""
+    import urllib.request, urllib.error
+    msgs = [{"role": "system", "content": system}]
+    for m in messages:
+        if m.get("role") in ("user", "assistant") and m.get("content"):
+            msgs.append({"role": m["role"], "content": m["content"]})
+    body = {"model": model, "messages": msgs, "max_tokens": 1024}
+    headers = {
+        "Content-Type": "application/json",
+        "Authorization": f"Bearer {api_key}",
+    }
+    if provider_label == "openrouter":
+        headers["HTTP-Referer"] = "https://github.com/Denromvas/ostv"
+        headers["X-Title"] = "OsTv"
+    try:
+        def _do():
+            req = urllib.request.Request(
+                f"{base_url}/chat/completions",
+                data=json.dumps(body).encode(),
+                headers=headers,
+                method="POST",
+            )
+            with urllib.request.urlopen(req, timeout=60) as r:
+                return r.read().decode()
+        raw = await asyncio.to_thread(_do)
+        data = json.loads(raw)
+        reply = data.get("choices", [{}])[0].get("message", {}).get("content", "")
+        return {"ok": True, "reply": reply, "actions": [],
+                "backend": provider_label, "model": model}
+    except urllib.error.HTTPError as e:
+        body = e.read().decode(errors="ignore")[:300]
+        return {"ok": False,
+                "error": f"{provider_label} HTTP {e.code}: {body}",
+                "backend": provider_label}
+    except Exception as e:
+        return {"ok": False, "error": f"{provider_label}: {e}", "backend": provider_label}
+
+
+async def _ai_chat_gemini(messages: list, system: str, model: str, api_key: str) -> dict:
+    """Gemini REST API."""
+    import urllib.request, urllib.error
+    contents = []
+    for m in messages:
+        role = m.get("role")
+        if role not in ("user", "assistant") or not m.get("content"):
+            continue
+        contents.append({
+            "role": "user" if role == "user" else "model",
+            "parts": [{"text": m["content"]}],
+        })
+    body = {
+        "contents": contents,
+        "systemInstruction": {"parts": [{"text": system}]},
+        "generationConfig": {"maxOutputTokens": 1024},
+    }
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={api_key}"
+    try:
+        def _do():
+            req = urllib.request.Request(url,
+                data=json.dumps(body).encode(),
+                headers={"Content-Type": "application/json"},
+                method="POST",
+            )
+            with urllib.request.urlopen(req, timeout=60) as r:
+                return r.read().decode()
+        raw = await asyncio.to_thread(_do)
+        data = json.loads(raw)
+        cand = (data.get("candidates") or [{}])[0]
+        parts = cand.get("content", {}).get("parts") or [{}]
+        reply = "".join(p.get("text", "") for p in parts)
+        return {"ok": True, "reply": reply, "actions": [], "backend": "gemini", "model": model}
+    except urllib.error.HTTPError as e:
+        return {"ok": False,
+                "error": f"gemini HTTP {e.code}: {e.read().decode(errors='ignore')[:300]}",
+                "backend": "gemini"}
+    except Exception as e:
+        return {"ok": False, "error": f"gemini: {e}", "backend": "gemini"}
+
+
+async def _ai_chat_ollama(messages: list, system: str, model: str, base_url: str) -> dict:
+    """Ollama локальний (HTTP /api/chat)."""
+    import urllib.request, urllib.error
+    msgs = [{"role": "system", "content": system}]
+    for m in messages:
+        if m.get("role") in ("user", "assistant") and m.get("content"):
+            msgs.append({"role": m["role"], "content": m["content"]})
+    body = {"model": model, "messages": msgs, "stream": False}
+    try:
+        def _do():
+            req = urllib.request.Request(
+                f"{base_url}/api/chat",
+                data=json.dumps(body).encode(),
+                headers={"Content-Type": "application/json"},
+                method="POST",
+            )
+            with urllib.request.urlopen(req, timeout=120) as r:
+                return r.read().decode()
+        raw = await asyncio.to_thread(_do)
+        data = json.loads(raw)
+        reply = data.get("message", {}).get("content", "")
+        return {"ok": True, "reply": reply, "actions": [], "backend": "ollama", "model": model}
+    except urllib.error.URLError as e:
+        return {"ok": False, "error": f"ollama unreachable ({base_url}): {e}",
+                "backend": "ollama"}
+    except Exception as e:
+        return {"ok": False, "error": f"ollama: {e}", "backend": "ollama"}
+
+
 async def tool_ai_chat(messages: list, system: str | None = None, backend: str | None = None) -> dict:
-    """AI chat. Backend:
-       - "claude-cli" (default): викликає `claude -p` з full conversation history
-       - "anthropic-sdk": прямий Anthropic API (потребує ANTHROPIC_API_KEY)
+    """AI chat. Backend (provider) береться з ai.conf або з аргументу.
+    Підтримувані: claude_cli (default, OAuth), claude_api (Anthropic SDK з ключем),
+    openai, gemini, openrouter, ollama (тільки text-чат, без tool-use).
+    Tool-use повноцінно працює тільки в claude_cli/claude_api.
     """
-    backend = backend or os.environ.get("OSTV_AI_BACKEND", "claude-cli")
-    if backend == "claude-cli":
-        if not messages:
-            return {"ok": False, "error": "no messages"}
+    if not messages:
+        return {"ok": False, "error": "no messages"}
+
+    cfg = _load_ai_config()
+    # back-compat: алias-и старих назв
+    alias = {"claude-cli": "claude_cli", "anthropic-sdk": "claude_api"}
+    provider = alias.get(backend, backend) if backend else cfg["provider"]
+    model    = cfg["model"]   if not backend else (cfg["model"] if backend in ("", None) else DEFAULT_MODELS.get(provider, cfg["model"]))
+    base_url = cfg["base_url"] or DEFAULT_BASE_URLS.get(provider)
+    sys_prompt = system or AI_SYSTEM_PROMPT
+
+    # === claude_cli (OAuth) ===
+    if provider == "claude_cli":
         return await _ai_chat_via_cli(messages)
 
-    # --- Anthropic SDK fallback ---
+    # === openai / openrouter (OpenAI-compatible) ===
+    if provider in ("openai", "openrouter"):
+        key = _load_secret(PROVIDER_KEY_NAME[provider])
+        if not key:
+            return {"ok": False,
+                    "error": f"Немає {PROVIDER_KEY_NAME[provider]}. Settings → AI API key.",
+                    "backend": provider}
+        return await _ai_chat_openai_compat(messages, sys_prompt, model,
+                                            base_url, key, provider_label=provider)
+
+    # === gemini ===
+    if provider == "gemini":
+        key = _load_secret("GEMINI_API_KEY")
+        if not key:
+            return {"ok": False,
+                    "error": "Немає GEMINI_API_KEY. Settings → AI API key.",
+                    "backend": "gemini"}
+        return await _ai_chat_gemini(messages, sys_prompt, model, key)
+
+    # === ollama (без ключа, локальний) ===
+    if provider == "ollama":
+        return await _ai_chat_ollama(messages, sys_prompt, model, base_url)
+
+    # === claude_api (Anthropic SDK з tool-use) ===
     if not ANTHROPIC_AVAILABLE:
-        return {"ok": False, "error": "anthropic SDK не встановлено"}
+        return {"ok": False, "error": "anthropic SDK не встановлено", "backend": provider}
 
     api_key = _load_anthropic_key()
     if not api_key:
@@ -664,7 +922,7 @@ async def tool_ai_chat(messages: list, system: str | None = None, backend: str |
         }
 
     client = Anthropic(api_key=api_key)
-    sys_prompt = system or AI_SYSTEM_PROMPT
+    # sys_prompt вже defined вище
 
     # Claude expects messages as list of {role, content} з текстом або array of blocks
     claude_messages: list = []
@@ -682,7 +940,7 @@ async def tool_ai_chat(messages: list, system: str | None = None, backend: str |
         try:
             resp = await asyncio.to_thread(
                 client.messages.create,
-                model=CLAUDE_MODEL,
+                model=model,
                 max_tokens=1024,
                 system=sys_prompt,
                 tools=AI_TOOLS_SCHEMA,
@@ -732,7 +990,8 @@ async def tool_ai_chat(messages: list, system: str | None = None, backend: str |
             "reply": "\n".join(text_parts).strip(),
             "actions": actions,
             "stop_reason": resp.stop_reason,
-            "model": CLAUDE_MODEL,
+            "model": model,
+            "backend": "claude_api",
         }
 
     return {"ok": False, "error": "max iterations", "actions": actions}
@@ -1326,40 +1585,80 @@ async def tool_history_clear(only_finished: bool = False) -> dict:
 
 
 async def tool_ai_status() -> dict:
-    """Швидкий health-check AI підсистеми. Повертає статус кожного backend без виклику моделі."""
-    out = {"ok": True, "claude_cli": False, "anthropic_sdk": False, "anthropic_key": False, "preferred": None}
-    # claude CLI installed?
-    if os.path.exists("/usr/bin/claude"):
-        out["claude_cli"] = True
-        # Перевіримо OAuth credentials у tv home
-        cred = "/home/tv/.claude/.credentials.json"
-        try:
-            if os.path.exists(cred) and os.path.getsize(cred) > 50:
-                out["claude_cli_auth"] = True
-            else:
-                out["claude_cli_auth"] = False
-        except Exception:
-            out["claude_cli_auth"] = False
-    # Anthropic SDK?
-    if ANTHROPIC_AVAILABLE:
-        out["anthropic_sdk"] = True
-    # API key present?
-    if _load_anthropic_key():
-        out["anthropic_key"] = True
+    """Health-check AI підсистеми + список доступних провайдерів."""
+    cfg = _load_ai_config()
+    out: dict = {"ok": True, "provider": cfg["provider"], "model": cfg["model"],
+                 "base_url": cfg["base_url"]}
 
-    # Preferred backend (за дефолтом — claude-cli якщо живий+autorized)
-    preferred = os.environ.get("OSTV_AI_BACKEND")
-    if not preferred:
-        if out["claude_cli"] and out.get("claude_cli_auth"):
-            preferred = "claude-cli"
-        elif out["anthropic_sdk"] and out["anthropic_key"]:
-            preferred = "anthropic-sdk"
-        else:
-            preferred = "none"
-    out["preferred"] = preferred
-    out["healthy"] = preferred != "none"
-    out["model"] = CLAUDE_MODEL
+    # Backward-compat keys (use ce фронт)
+    out["claude_cli"] = os.path.exists("/usr/bin/claude")
+    out["claude_cli_auth"] = False
+    if out["claude_cli"]:
+        try:
+            cred = "/home/tv/.claude/.credentials.json"
+            out["claude_cli_auth"] = os.path.exists(cred) and os.path.getsize(cred) > 50
+        except Exception:
+            pass
+    out["anthropic_sdk"] = ANTHROPIC_AVAILABLE
+    out["anthropic_key"] = bool(_load_anthropic_key())
+
+    # Список усіх провайдерів + чи готовий кожен
+    providers = {}
+    providers["claude_cli"] = {
+        "name": "Claude CLI (OAuth)",
+        "ready": out["claude_cli"] and out["claude_cli_auth"],
+        "needs_key": False,
+    }
+    providers["claude_api"] = {
+        "name": "Anthropic API",
+        "ready": out["anthropic_sdk"] and out["anthropic_key"],
+        "needs_key": True, "key_var": "ANTHROPIC_API_KEY",
+    }
+    for prov, kvar in (("openai", "OPENAI_API_KEY"),
+                       ("gemini", "GEMINI_API_KEY"),
+                       ("openrouter", "OPENROUTER_API_KEY")):
+        providers[prov] = {
+            "name": prov.capitalize(),
+            "ready": bool(_load_secret(kvar)),
+            "needs_key": True, "key_var": kvar,
+        }
+    # Ollama: ready якщо socket localhost:11434 відповідає (швидкий перевір без важкого імпорту)
+    ollama_ready = False
+    try:
+        import socket as _s
+        with _s.create_connection(("localhost", 11434), timeout=1):
+            ollama_ready = True
+    except Exception:
+        pass
+    providers["ollama"] = {"name": "Ollama (local)", "ready": ollama_ready, "needs_key": False}
+
+    out["providers"] = providers
+    cur = providers.get(cfg["provider"], {})
+    out["healthy"] = cur.get("ready", False)
+    out["preferred"] = cfg["provider"]   # back-compat alias
     return out
+
+
+async def tool_ai_set_provider(provider: str, model: str | None = None,
+                                api_key: str | None = None,
+                                base_url: str | None = None) -> dict:
+    """Зберігає вибір провайдера у /etc/ostv/ai.conf і (якщо передано api_key) у secrets.env."""
+    if provider not in DEFAULT_MODELS:
+        return {"ok": False, "error": f"unknown provider: {provider}",
+                "available": list(DEFAULT_MODELS.keys())}
+    try:
+        _save_ai_config(provider, model=model, base_url=base_url)
+    except PermissionError as e:
+        return {"ok": False, "error": f"cannot write {AI_CONF_PATH}: {e}"}
+    if api_key and provider in PROVIDER_KEY_NAME:
+        try:
+            _save_secret(PROVIDER_KEY_NAME[provider], api_key)
+        except PermissionError as e:
+            return {"ok": False, "error": f"cannot write secrets.env: {e}",
+                    "config_saved": True}
+    return {"ok": True, "provider": provider,
+            "model": model or DEFAULT_MODELS[provider],
+            "base_url": base_url or DEFAULT_BASE_URLS.get(provider)}
 
 
 async def tool_ai_test(backend: str | None = None) -> dict:
@@ -1758,6 +2057,7 @@ TOOLS = {
     "ai_status": tool_ai_status,
     "ai_test": tool_ai_test,
     "ai_reauth": tool_ai_reauth,
+    "ai_set_provider": tool_ai_set_provider,
     "list_apps": tool_list_apps,
     "propose_module": tool_propose_module,
     "approve_module": tool_approve_module,

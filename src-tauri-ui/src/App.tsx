@@ -1023,6 +1023,71 @@ function SettingsScreen({ onBack, settings, onChange }: {
   const [updating, setUpdating] = useState(false);
   const [aiStatus, setAiStatus] = useState<string>("?");
   const [aiTesting, setAiTesting] = useState(false);
+  const [aiProvider, setAiProvider] = useState<string>("claude_cli");
+  const [aiModel, setAiModel] = useState<string>("");
+  const [aiProviders, setAiProviders] = useState<Record<string, any>>({});
+
+  const PROVIDER_ORDER = ["claude_cli", "claude_api", "openai", "gemini", "openrouter", "ollama"];
+  const DEFAULT_MODELS: Record<string, string> = {
+    claude_cli: "claude-haiku-4-5",
+    claude_api: "claude-haiku-4-5",
+    openai: "gpt-4o-mini",
+    gemini: "gemini-2.0-flash",
+    openrouter: "anthropic/claude-haiku-4-5",
+    ollama: "qwen2.5:3b",
+  };
+
+  const cycleProvider = useCallback(async () => {
+    const idx = PROVIDER_ORDER.indexOf(aiProvider);
+    const next = PROVIDER_ORDER[(idx + 1) % PROVIDER_ORDER.length];
+    const nextModel = DEFAULT_MODELS[next];
+    try {
+      const r = await invoke<any>("brain_call", {
+        method: "ai_set_provider",
+        params: { provider: next, model: nextModel },
+      });
+      const v = r?.result;
+      if (v?.ok) {
+        setAiProvider(next);
+        setAiModel(nextModel);
+        setTimeout(() => refreshAiStatus(), 200);
+      } else {
+        setAiStatus(`✗ ${v?.error || "set provider"}`);
+      }
+    } catch (e) { setAiStatus(`✗ ${e}`); }
+  }, [aiProvider]);
+
+  const promptApiKey = useCallback(async () => {
+    if (aiProvider === "claude_cli" || aiProvider === "ollama") {
+      setAiStatus(`${aiProvider}: ключ не потрібен`);
+      return;
+    }
+    const k = prompt(`API key для ${aiProvider}:`);
+    if (!k || !k.trim()) return;
+    try {
+      const r = await invoke<any>("brain_call", {
+        method: "ai_set_provider",
+        params: { provider: aiProvider, model: aiModel || DEFAULT_MODELS[aiProvider], api_key: k.trim() },
+      });
+      const v = r?.result;
+      if (v?.ok) { setAiStatus("✓ ключ збережено"); refreshAiStatus(); }
+      else setAiStatus(`✗ ${v?.error}`);
+    } catch (e) { setAiStatus(`✗ ${e}`); }
+  }, [aiProvider, aiModel]);
+
+  const promptModel = useCallback(async () => {
+    const m = prompt(`Модель для ${aiProvider}:`, aiModel || DEFAULT_MODELS[aiProvider]);
+    if (!m || !m.trim()) return;
+    try {
+      const r = await invoke<any>("brain_call", {
+        method: "ai_set_provider",
+        params: { provider: aiProvider, model: m.trim() },
+      });
+      const v = r?.result;
+      if (v?.ok) { setAiModel(m.trim()); setAiStatus("✓ модель оновлено"); refreshAiStatus(); }
+      else setAiStatus(`✗ ${v?.error}`);
+    } catch (e) { setAiStatus(`✗ ${e}`); }
+  }, [aiProvider, aiModel]);
 
   const reloadApps = useCallback(async () => {
     try {
@@ -1045,18 +1110,16 @@ function SettingsScreen({ onBack, settings, onChange }: {
       const r = await invoke<any>("brain_call", { method: "ai_status", params: {} });
       const v = r?.result;
       if (!v) { setAiStatus("offline"); return; }
-      if (v.preferred === "claude-cli" && v.claude_cli && v.claude_cli_auth) {
-        setAiStatus(`✓ claude CLI · ${v.model}`);
-        setApiKeyStatus("✓ OAuth (claude CLI)");
-      } else if (v.preferred === "anthropic-sdk" && v.anthropic_key) {
-        setAiStatus(`✓ Anthropic API · ${v.model}`);
-        setApiKeyStatus("✓ API key");
-      } else if (v.claude_cli && !v.claude_cli_auth) {
-        setAiStatus(`⚠ claude CLI без auth — тицьни Reauth`);
-        setApiKeyStatus("✗ OAuth не пройдений");
+      setAiProvider(v.provider || "claude_cli");
+      setAiModel(v.model || "");
+      setAiProviders(v.providers || {});
+      const cur = (v.providers || {})[v.provider] || {};
+      if (cur.ready) {
+        setAiStatus(`✓ ${v.provider} · ${v.model}`);
+        setApiKeyStatus(cur.needs_key ? "✓ ключ є" : "✓ OAuth/local");
       } else {
-        setAiStatus("✗ AI не налаштовано");
-        setApiKeyStatus("✗ нема ні OAuth ні API key");
+        setAiStatus(`⚠ ${v.provider} не готовий`);
+        setApiKeyStatus(cur.needs_key ? `✗ нема ${cur.key_var}` : "✗ оffline");
       }
     } catch { setAiStatus("offline"); }
   }, []);
@@ -1127,9 +1190,17 @@ function SettingsScreen({ onBack, settings, onChange }: {
     { label: "Brain version", value: brainVersion, onToggle: () => {} },
     { label: "AI status", value: aiStatus,
       onToggle: () => { if (!aiTesting) aiTest(); } },
+    { label: "AI provider", value: `${aiProvider} ${aiProviders[aiProvider]?.ready ? "✓" : "✗"}`,
+      onToggle: cycleProvider },
+    { label: "AI model", value: aiModel || "(default)",
+      onToggle: promptModel },
+    { label: "AI API key",
+      value: aiProvider === "claude_cli" ? "OAuth" :
+             aiProvider === "ollama" ? "—" :
+             apiKeyStatus,
+      onToggle: promptApiKey },
     { label: "AI reauth (Claude CLI)", value: "→ /login в xterm",
       onToggle: aiReauth },
-    { label: "Anthropic API key", value: apiKeyStatus, onToggle: () => {} },
     { label: "OsTv updates", value: updateInfo,
       onToggle: () => {
         if (updating) return;
