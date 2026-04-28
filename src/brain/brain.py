@@ -346,10 +346,11 @@ async def tool_play_url(url: str, fullscreen: bool = True, quality: str = "1080p
         "--no-config",                    # не читаємо user config
         "--input-default-bindings=yes",   # але залишаємо default keybinds (esc=quit, space=pause)
         "--input-vo-keyboard=yes",
-        "--vo=gpu", "--hwdec=no",
+        "--vo=gpu,x11,xv", "--hwdec=no",  # gpu для TV з GT 630, x11/xv — fallback для VM/Hyper-V (без GPU)
         "--cache=yes", "--cache-secs=30",
         f"--fullscreen={'yes' if fullscreen else 'no'}",
         "--input-ipc-server=/run/ostv/mpv.sock",
+        "--script-opts=ytdl_hook-ytdl_path=/opt/ostv/venv/bin/yt-dlp",  # свіжий yt-dlp з venv (apt застарілий)
         "--msg-level=all=warn",
         "--keep-open=no",                 # exit одразу після EOF
     ]
@@ -1464,6 +1465,7 @@ async def tool_play_playlist(files: list, mode: str = "video",
         "--input-conf=/opt/ostv/mpv.input.conf",
         f"--fullscreen={'yes' if fullscreen else 'no'}",
         "--input-ipc-server=/run/ostv/mpv.sock",
+        "--script-opts=ytdl_hook-ytdl_path=/opt/ostv/venv/bin/yt-dlp",  # свіжий yt-dlp з venv (apt застарілий)
         "--msg-level=all=warn",
         "--keep-open=no",
     ]
