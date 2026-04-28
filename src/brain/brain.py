@@ -471,42 +471,9 @@ async def tool_search_youtube(query: str, limit: int = 12) -> dict:
 CLAUDE_MODEL = os.environ.get("OSTV_CLAUDE_MODEL", "claude-haiku-4-5")
 
 AI_TOOLS_SCHEMA = [
-    {
-        "name": "ha_lights",
-        "description": "Керування світлом через Home Assistant. Викликати коли користувач просить увімкнути/вимкнути/переключити світло. action: turn_on | turn_off | toggle. room — назва кімнати (українською або англ., рядок-фрагмент імені) або 'all' для всіх.",
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "action": {"type": "string", "enum": ["turn_on", "turn_off", "toggle"]},
-                "room": {"type": "string", "description": "наприклад 'вітальня', 'спальня', 'kitchen', 'all'"},
-            },
-            "required": ["action"],
-        },
-    },
-    {
-        "name": "ha_call",
-        "description": "Викликає будь-який сервіс Home Assistant. Для не-light entities: switch, media_player, climate, fan, scene, automation, тощо. Приклад: entity_id='switch.tv', service='turn_on'. Або entity_id='climate.living_room', service='set_temperature', data={'temperature': 22}.",
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "entity_id": {"type": "string"},
-                "service":   {"type": "string", "description": "turn_on/turn_off/toggle/set_temperature/play_media/..."},
-                "data":      {"type": "object", "description": "доп. параметри сервісу"},
-            },
-            "required": ["entity_id", "service"],
-        },
-    },
-    {
-        "name": "ha_states",
-        "description": "Отримати список entities Home Assistant з поточним state. Корисно щоб розвідати які кімнати/прилади доступні. domain: light/switch/sensor/climate/media_player/...",
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "domain": {"type": "string"},
-                "limit":  {"type": "integer", "default": 30},
-            },
-        },
-    },
+    # NOTE: HA tools (ha_lights/ha_call/ha_states) поки НЕ exposed AI —
+    # доступні тільки через прямий brain_call із UI/CLI. Додамо в schema коли
+    # юзер сам захоче голосове керування домом.
     {
         "name": "search_all",
         "description": "Пошук фільмів/відео у всіх джерелах (YouTube + парсери). Повертає список результатів з title, url, thumbnail.",
@@ -1880,6 +1847,28 @@ async def _ha_request(path: str, method: str = "GET", body: dict | None = None) 
         return {"ok": False, "error": f"HA: {e}"}
 
 
+async def tool_ha_set_config(url: str | None = None, token: str | None = None) -> dict:
+    """Зберігає HA_URL та/або HA_TOKEN у /etc/ostv/secrets.env (щоб не редагувати руками)."""
+    saved = {}
+    try:
+        if url is not None:
+            url = url.strip().rstrip("/")
+            if url and not url.startswith(("http://", "https://")):
+                url = f"http://{url}"
+            _save_secret("HA_URL", url)
+            saved["url"] = url
+        if token is not None:
+            token = token.strip()
+            if token:
+                _save_secret("HA_TOKEN", token)
+                saved["token_len"] = len(token)
+    except PermissionError as e:
+        return {"ok": False, "error": f"cannot write secrets.env: {e}"}
+    if not saved:
+        return {"ok": False, "error": "потрібен url та/або token"}
+    return {"ok": True, "saved": saved}
+
+
 async def tool_ha_status() -> dict:
     """Перевірка зв'язку з Home Assistant — повертає version+state count."""
     base = _load_secret("HA_URL")
@@ -2257,6 +2246,7 @@ TOOLS = {
     "history_clear": tool_history_clear,
     "update_check": tool_update_check,
     "update_apply": tool_update_apply,
+    "ha_set_config": tool_ha_set_config,
     "ha_status": tool_ha_status,
     "ha_states": tool_ha_states,
     "ha_call": tool_ha_call,

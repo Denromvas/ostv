@@ -1139,6 +1139,42 @@ function SettingsScreen({ onBack, settings, onChange }: {
   const [aiProvider, setAiProvider] = useState<string>("claude_cli");
   const [aiModel, setAiModel] = useState<string>("");
   const [aiProviders, setAiProviders] = useState<Record<string, any>>({});
+  const [haStatus, setHaStatus] = useState<string>("(не перевірено)");
+
+  const refreshHa = useCallback(async () => {
+    try {
+      const r = await invoke<any>("brain_call", { method: "ha_status", params: {} });
+      const v = r?.result;
+      if (!v) { setHaStatus("offline"); return; }
+      if (v.ok) {
+        setHaStatus(`✓ ${v.version || "?"} · ${v.entity_count || 0} entities`);
+      } else if (!v.configured) {
+        setHaStatus("✗ не налаштовано");
+      } else {
+        setHaStatus(`✗ ${v.error || "недоступний"}`);
+      }
+    } catch (e) { setHaStatus(`✗ ${e}`); }
+  }, []);
+
+  const promptHaUrl = useCallback(async () => {
+    const url = prompt("URL Home Assistant (наприклад http://192.168.88.50:8123):", "http://192.168.88.50:8123");
+    if (!url || !url.trim()) return;
+    try {
+      const r = await invoke<any>("brain_call", { method: "ha_set_config", params: { url: url.trim() } });
+      if (r?.result?.ok) { setHaStatus("✓ URL збережено"); refreshHa(); }
+      else setHaStatus(`✗ ${r?.result?.error}`);
+    } catch (e) { setHaStatus(`✗ ${e}`); }
+  }, [refreshHa]);
+
+  const promptHaToken = useCallback(async () => {
+    const t = prompt("HA Long-Lived Access Token (HA → Profile → Long-Lived Access Tokens):");
+    if (!t || !t.trim()) return;
+    try {
+      const r = await invoke<any>("brain_call", { method: "ha_set_config", params: { token: t.trim() } });
+      if (r?.result?.ok) { setHaStatus("✓ token збережено"); refreshHa(); }
+      else setHaStatus(`✗ ${r?.result?.error}`);
+    } catch (e) { setHaStatus(`✗ ${e}`); }
+  }, [refreshHa]);
 
   const PROVIDER_ORDER = ["claude_cli", "claude_api", "openai", "gemini", "openrouter", "ollama"];
   const DEFAULT_MODELS: Record<string, string> = {
@@ -1262,7 +1298,8 @@ function SettingsScreen({ onBack, settings, onChange }: {
       .then((r) => setBrainVersion(r?.result?.version || "?"))
       .catch(() => setBrainVersion("offline"));
     refreshAiStatus();
-  }, [refreshAiStatus]);
+    refreshHa();
+  }, [refreshAiStatus, refreshHa]);
 
   const checkUpdate = useCallback(async () => {
     setUpdateInfo("перевіряю...");
@@ -1314,6 +1351,12 @@ function SettingsScreen({ onBack, settings, onChange }: {
       onToggle: promptApiKey },
     { label: "AI reauth (Claude CLI)", value: "→ /login в xterm",
       onToggle: aiReauth },
+    { label: "Home Assistant", value: haStatus,
+      onToggle: () => { refreshHa(); } },
+    { label: "HA URL", value: "→ натисни щоб задати",
+      onToggle: promptHaUrl },
+    { label: "HA Token", value: "→ натисни щоб задати",
+      onToggle: promptHaToken },
     { label: "OsTv updates", value: updateInfo,
       onToggle: () => {
         if (updating) return;
