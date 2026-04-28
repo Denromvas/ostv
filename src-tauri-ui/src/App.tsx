@@ -439,36 +439,50 @@ function SourceScreen({ onBack, title, brainMethod, accentColor, placeholder }: 
     }
   }, [query, brainMethod]);
 
-  const play = useCallback(async (v: VideoResult) => {
-    const shortTitle = v.title.slice(0, 60);
+  const [episodePicker, setEpisodePicker] = useState<any>(null);
+
+  const playWithPicker = useCallback(async (v: VideoResult, season?: number, episode?: number, translator?: string) => {
+    const epLabel = (season && episode) ? ` · S${season}E${episode}` : "";
+    const shortTitle = (v.title + epLabel).slice(0, 80);
     setLaunching({ title: shortTitle, detail: "витягую потік..." });
     setStatus(`▶ ${shortTitle}...`);
     try {
-      const r = await invoke<any>("brain_call", {
-        method: "play_url",
-        params: {
-          url: v.url,
-          title: v.title,
-          source: v.source,
-          thumbnail: v.thumbnail,
-          query: query,
-        },
-      });
-      const err = r?.result?.error || r?.error;
+      const params: any = {
+        url: v.url,
+        title: v.title,
+        source: v.source,
+        thumbnail: v.thumbnail,
+        query: query,
+      };
+      if (season) params.season = season;
+      if (episode) params.episode = episode;
+      if (translator) params.translator = translator;
+      const r = await invoke<any>("brain_call", { method: "play_url", params });
+      const result = r?.result;
+      // Series picker — Brain каже "потрібно вибрати епізод"
+      if (result?.needs_episode_picker) {
+        setLaunching(null);
+        setEpisodePicker({ video: v, ...result });
+        setStatus(`▸ обери епізод`);
+        return;
+      }
+      const err = result?.error || r?.error;
       if (err) {
         setLaunching(null);
         setStatus(`✗ ${err}`);
         return;
       }
+      setEpisodePicker(null);
       setLaunching({ title: shortTitle, detail: "mpv стартує..." });
-      // Even after invoke returns, mpv потребує ~2-3 сек на відкриття. Тримаємо overlay.
       setTimeout(() => setLaunching(null), 3500);
       setStatus(`✓ Playing — [S]top, [Esc] back`);
     } catch (e) {
       setLaunching(null);
       setStatus(`✗ ${e}`);
     }
-  }, []);
+  }, [query]);
+
+  const play = useCallback((v: VideoResult) => playWithPicker(v), [playWithPicker]);
 
   useEffect(() => {
     function handler(e: KeyboardEvent) {
@@ -560,6 +574,16 @@ function SourceScreen({ onBack, title, brainMethod, accentColor, placeholder }: 
         />
       )}
       {launching && <LaunchOverlay title={launching.title} detail={launching.detail} />}
+      {episodePicker && (
+        <EpisodePickerOverlay
+          data={episodePicker}
+          onPick={(season, ep, translator) => {
+            setEpisodePicker(null);
+            playWithPicker(episodePicker.video, season, ep, translator);
+          }}
+          onClose={() => setEpisodePicker(null)}
+        />
+      )}
 
       <main className="stage results-stage">
         {results.length === 0 && !searching && (
@@ -681,6 +705,85 @@ function PowerOverlay({ onClose }: { onClose: () => void }) {
         </div>
         {status && <div className="power-status">{status}</div>}
         <div className="power-hint">↑↓ NAV · [ENTER] · [ESC] скасувати</div>
+      </div>
+    </div>
+  );
+}
+
+
+// ============ Episode Picker (HDRezka series) ============
+function EpisodePickerOverlay({ data, onPick, onClose }: {
+  data: any;
+  onPick: (season: number, episode: number, translator: string) => void;
+  onClose: () => void;
+}) {
+  const seasons: { id: number; name: string }[] = data.seasons || [];
+  const episodes: Record<string, { id: number; name: string }[]> = data.episodes || {};
+  const [seasonId, setSeasonId] = useState<number>(seasons[0]?.id || 1);
+  const [seasonFocus, setSeasonFocus] = useState(0);
+  const [epFocus, setEpFocus] = useState(0);
+  const [pane, setPane] = useState<"seasons" | "episodes">("seasons");
+  const epList = episodes[String(seasonId)] || [];
+
+  useEffect(() => {
+    function h(e: KeyboardEvent) {
+      if (e.key === "Escape") { e.preventDefault(); onClose(); return; }
+      if (e.key === "ArrowLeft" && pane === "episodes") { e.preventDefault(); setPane("seasons"); return; }
+      if (e.key === "ArrowRight" && pane === "seasons") { e.preventDefault(); setPane("episodes"); return; }
+      if (pane === "seasons") {
+        if (e.key === "ArrowDown") { e.preventDefault(); setSeasonFocus(i => Math.min(seasons.length - 1, i + 1)); }
+        if (e.key === "ArrowUp")   { e.preventDefault(); setSeasonFocus(i => Math.max(0, i - 1)); }
+        if (e.key === "Enter") {
+          e.preventDefault();
+          const sel = seasons[seasonFocus];
+          if (sel) { setSeasonId(sel.id); setEpFocus(0); setPane("episodes"); }
+        }
+      } else {
+        if (e.key === "ArrowDown") { e.preventDefault(); setEpFocus(i => Math.min(epList.length - 1, i + 1)); }
+        if (e.key === "ArrowUp")   { e.preventDefault(); setEpFocus(i => Math.max(0, i - 1)); }
+        if (e.key === "Enter") {
+          e.preventDefault();
+          const ep = epList[epFocus];
+          if (ep) onPick(seasonId, ep.id, data.translator_id);
+        }
+      }
+    }
+    window.addEventListener("keydown", h);
+    return () => window.removeEventListener("keydown", h);
+  }, [pane, seasons, epList, seasonFocus, epFocus, seasonId, data.translator_id, onPick, onClose]);
+
+  return (
+    <div className="ep-overlay" onClick={onClose}>
+      <div className="ep-box" onClick={(e) => e.stopPropagation()}>
+        <div className="ep-header">
+          <span className="ep-title">{data.title}</span>
+          {data.translator_name && <span className="ep-tr">▸ {data.translator_name}</span>}
+          <button className="ai-close" onClick={onClose}>✕</button>
+        </div>
+        <div className="ep-body">
+          <div className={`ep-pane seasons ${pane === "seasons" ? "active" : ""}`}>
+            <div className="ep-pane-title">СЕЗОНИ</div>
+            {seasons.map((s, idx) => (
+              <div key={s.id}
+                   className={`ep-row ${pane === "seasons" && idx === seasonFocus ? "focused" : ""} ${seasonId === s.id ? "selected" : ""}`}
+                   onClick={() => { setSeasonFocus(idx); setSeasonId(s.id); setEpFocus(0); setPane("episodes"); }}>
+                {s.name}
+              </div>
+            ))}
+          </div>
+          <div className={`ep-pane episodes ${pane === "episodes" ? "active" : ""}`}>
+            <div className="ep-pane-title">ЕПІЗОДИ</div>
+            {epList.length === 0 && <div className="ep-empty">(немає у обраного перекладача)</div>}
+            {epList.map((ep, idx) => (
+              <div key={ep.id}
+                   className={`ep-row ${pane === "episodes" && idx === epFocus ? "focused" : ""}`}
+                   onClick={() => onPick(seasonId, ep.id, data.translator_id)}>
+                <span className="ep-num">E{ep.id}</span> {ep.name}
+              </div>
+            ))}
+          </div>
+        </div>
+        <div className="ep-hint">←→ панелі · ↑↓ навігація · ENTER · ESC</div>
       </div>
     </div>
   );

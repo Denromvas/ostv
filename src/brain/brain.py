@@ -279,7 +279,9 @@ async def _kill_mpv():
 async def tool_play_url(url: str, fullscreen: bool = True, quality: str = "1080p",
                         title: str | None = None, source: str | None = None,
                         thumbnail: str | None = None, query: str | None = None,
-                        resume_position: float = 0.0) -> dict:
+                        resume_position: float = 0.0,
+                        season: int | None = None, episode: int | None = None,
+                        translator: str | None = None) -> dict:
     global current_mpv, current_history_id
 
     original_url = url  # запам'ятовуємо ВХІДНИЙ url — для resume HDRezka сторінки
@@ -288,9 +290,23 @@ async def tool_play_url(url: str, fullscreen: bool = True, quality: str = "1080p
     # Auto-detect HDRezka film page URL → extract stream first
     is_hdrezka = any(host in url for host in ("rezka.ag", "hdrezka.ag", "hdrezka.cc"))
     if (is_hdrezka and "/films/" in url) or (is_hdrezka and "/series/" in url):
-        log.info(f"play_url: auto-extracting HDRezka → {url}")
-        ex = await tool_extract_hdrezka(url=url, quality=quality)
+        log.info(f"play_url: auto-extracting HDRezka → {url} (s={season},e={episode})")
+        ex = await tool_extract_hdrezka(url=url, quality=quality,
+                                         translator=translator,
+                                         season=season, episode=episode)
         if not ex.get("ok"):
+            # Якщо це серіал без season/episode — повертаємо seasons/episodes для UI picker
+            if ex.get("error") == "series_needs_season_episode":
+                ep = await tool_hdrezka_episodes(url)
+                if ep.get("ok"):
+                    return {"ok": False, "needs_episode_picker": True,
+                            "title": ep.get("title") or title,
+                            "thumbnail": ep.get("thumbnail") or thumbnail,
+                            "translator_id": ep.get("translator_id"),
+                            "translator_name": ep.get("translator_name"),
+                            "seasons": ep.get("seasons", []),
+                            "episodes": ep.get("episodes", {}),
+                            "page_url": url}
             return ex
         url = ex["url"]
         if not source:
@@ -300,6 +316,12 @@ async def tool_play_url(url: str, fullscreen: bool = True, quality: str = "1080p
         extra["quality"] = ex.get("quality") or quality
         if ex.get("translator_id") is not None:
             extra["translator_id"] = ex["translator_id"]
+        if ex.get("season") is not None:
+            extra["season"] = ex["season"]
+            extra["episode"] = ex["episode"]
+            # Додаємо до title епізод щоб у history було видно
+            if title and (ex.get("season") or ex.get("episode")):
+                title = f"{title} · S{ex['season']:02d}E{ex['episode']:02d}"
         log.info(f"extracted stream: {url[:80]}")
 
     # Auto-detect YouTube
@@ -1964,11 +1986,21 @@ async def tool_search_hdrezka(query: str, limit: int = 8) -> dict:
     return data
 
 
-async def tool_extract_hdrezka(url: str, quality: str = "1080p", translator: str | None = None) -> dict:
+async def tool_extract_hdrezka(url: str, quality: str = "1080p", translator: str | None = None,
+                                season: int | None = None, episode: int | None = None) -> dict:
     args = ["extract", url, "--quality", quality]
     if translator:
-        args += ["--translator", translator]
+        args += ["--translator", str(translator)]
+    if season is not None:
+        args += ["--season", str(season)]
+    if episode is not None:
+        args += ["--episode", str(episode)]
     return await _hdrezka_exec(*args, timeout=45)
+
+
+async def tool_hdrezka_episodes(url: str) -> dict:
+    """Повертає seasons/episodes для серіалу (або is_series=False для фільму)."""
+    return await _hdrezka_exec("info", url, timeout=45)
 
 
 FILMIX_PARSER = "/opt/ostv/parsers/filmix/filmix.py"
@@ -2035,6 +2067,7 @@ TOOLS = {
     "search_youtube": tool_search_youtube,
     "search_hdrezka": tool_search_hdrezka,
     "extract_hdrezka": tool_extract_hdrezka,
+    "hdrezka_episodes": tool_hdrezka_episodes,
     "search_filmix": tool_search_filmix,
     "extract_filmix": tool_extract_filmix,
     "search_all": tool_search_all,

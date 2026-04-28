@@ -24,7 +24,7 @@
 
 set -e
 
-OSTV_VERSION="${OSTV_VERSION:-0.1.4}"
+OSTV_VERSION="${OSTV_VERSION:-0.1.5}"
 RELEASE_URL="${RELEASE_URL:-https://denromvas.website/ostv/ostv-release-v${OSTV_VERSION}.tar.gz}"
 LOCAL_TARBALL=""
 SKIP_KIOSK=0
@@ -158,6 +158,14 @@ cp -r "$RELEASE_ROOT/brain/"* /opt/ostv/brain/
 cp -r "$RELEASE_ROOT/parsers/"* /opt/ostv/parsers/
 cp -r "$RELEASE_ROOT/bin/"* /opt/ostv/bin/
 cp "$RELEASE_ROOT/mpv.input.conf" /opt/ostv/mpv.input.conf 2>/dev/null || true
+sync   # дочекатись flush (інакше reboot може ловити 0-byte ostv-ui на slow disk)
+
+# Sanity check: ostv-ui не може бути 0 байт
+if [ ! -s /opt/ostv/bin/ostv-ui ]; then
+    echo "!!! /opt/ostv/bin/ostv-ui got truncated (0 bytes). Re-copying..."
+    cp -f "$RELEASE_ROOT/bin/ostv-ui" /opt/ostv/bin/ostv-ui
+    sync
+fi
 
 # updater
 if [ -f "$RELEASE_ROOT/update.sh" ]; then
