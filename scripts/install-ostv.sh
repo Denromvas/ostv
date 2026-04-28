@@ -24,7 +24,7 @@
 
 set -e
 
-OSTV_VERSION="${OSTV_VERSION:-0.1.6}"
+OSTV_VERSION="${OSTV_VERSION:-0.1.7}"
 RELEASE_URL="${RELEASE_URL:-https://denromvas.website/ostv/ostv-release-v${OSTV_VERSION}.tar.gz}"
 LOCAL_TARBALL=""
 SKIP_KIOSK=0

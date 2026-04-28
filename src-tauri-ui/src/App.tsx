@@ -216,6 +216,12 @@ function HomeScreen({ onOpen, onAddApp }: { onOpen: (app: AppConfig) => void; on
   const [focusedIdx, setFocusedIdx] = useState(0);
   const [status, setStatus] = useState("▸ READY");
   const { layout, toggle: toggleLayout } = useKbdLayout();
+  const [osVersion, setOsVersion] = useState("?");
+  useEffect(() => {
+    invoke<any>("brain_call", { method: "version", params: {} })
+      .then(r => setOsVersion(r?.result?.version || "?"))
+      .catch(() => {});
+  }, []);
 
   // dynamic apps від Brain (self-modified). Polling кожні 5с — нові apps з'являються без ручного refresh.
   const [dynamicApps, setDynamicApps] = useState<AppConfig[]>([]);
@@ -342,7 +348,7 @@ function HomeScreen({ onOpen, onAddApp }: { onOpen: (app: AppConfig) => void; on
       <header className="tv-header">
         <div className="logo-block">
           <span className="logo">OsTv</span>
-          <span className="logo-ver">v0.1.0</span>
+          <span className="logo-ver">v{osVersion}</span>
         </div>
         <div className="header-center">◉ HOME</div>
         <div className="header-right">
@@ -600,9 +606,13 @@ function SourceScreen({ onBack, title, brainMethod, accentColor, placeholder }: 
                  onMouseEnter={() => setFocusedIdx(idx)}
                  style={{ animationDelay: `${idx * 40}ms` }}>
               <div className="video-thumb" style={{
-                backgroundImage: v.thumbnail ? `url(${v.thumbnail})` : undefined,
                 background: !v.thumbnail ? `linear-gradient(135deg, ${accentColor}33, #000)` : undefined,
               }}>
+                {v.thumbnail && (
+                  <img src={v.thumbnail} alt=""
+                       style={{ width: "100%", height: "100%", objectFit: "cover", display: "block" }}
+                       onError={(e) => { (e.target as HTMLImageElement).style.display = "none"; }} />
+                )}
                 {!v.thumbnail && <span style={{fontSize: 32, color: accentColor}}>{(v.title || "?").slice(0, 2).toUpperCase()}</span>}
                 {v.duration && <span className="video-duration">{fmtDuration(v.duration)}</span>}
                 {(v as any).rating && <span className="video-duration" style={{left: 6, right: "auto"}}>★ {(v as any).rating}</span>}
@@ -2028,6 +2038,21 @@ export default function App() {
       if (e.altKey && (e.key === "h" || e.key === "H")) {
         e.preventDefault();
         setHistOpen(v => !v);
+        return;
+      }
+      // ESC: коли UI отримує ESC і це не у input — kill mpv (safety net якщо mpv не у фокусі)
+      if (e.key === "Escape" &&
+          document.activeElement?.tagName !== "INPUT" &&
+          document.activeElement?.tagName !== "TEXTAREA") {
+        // не блокуємо ESC у sidebars/overlays — вони мають свої обробники з preventDefault
+        invoke<any>("brain_call", { method: "status", params: {} })
+          .then(r => {
+            if (r?.result?.playing) {
+              invoke("brain_call", { method: "stop", params: {} }).catch(() => {});
+              showToast("■ STOP");
+            }
+          })
+          .catch(() => {});
         return;
       }
       // Media keys — працюють глобально

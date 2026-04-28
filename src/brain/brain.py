@@ -250,7 +250,19 @@ async def _watch_mpv_exit(proc: asyncio.subprocess.Process):
 # === TOOLS ===
 
 async def tool_ping() -> dict:
-    return {"ok": True, "msg": "pong", "version": "0.0.3"}
+    return {"ok": True, "msg": "pong", "version": "0.0.3", "os_version": _read_os_version()}
+
+
+def _read_os_version() -> str:
+    try:
+        with open("/etc/ostv/version") as f:
+            return f.read().strip() or "?"
+    except Exception:
+        return "?"
+
+
+async def tool_version() -> dict:
+    return {"ok": True, "version": _read_os_version()}
 
 
 async def tool_status() -> dict:
@@ -345,6 +357,7 @@ async def tool_play_url(url: str, fullscreen: bool = True, quality: str = "1080p
         "mpv",
         "--no-config",                    # не читаємо user config
         "--input-default-bindings=yes",   # але залишаємо default keybinds (esc=quit, space=pause)
+        "--input-conf=/opt/ostv/mpv.input.conf",  # наш input.conf (ESC quit, q quit, CLOSE_WIN quit)
         "--input-vo-keyboard=yes",
         "--vo=gpu,x11,xv", "--hwdec=no",  # gpu для TV з GT 630, x11/xv — fallback для VM/Hyper-V (без GPU)
         "--cache=yes", "--cache-secs=30",
@@ -2061,6 +2074,7 @@ async def tool_search_all(query: str, limit: int = 8) -> dict:
 
 TOOLS = {
     "ping": tool_ping,
+    "version": tool_version,
     "status": tool_status,
     "focus_ui": tool_focus_ui,
     "play_url": tool_play_url,
