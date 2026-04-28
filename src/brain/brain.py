@@ -472,6 +472,42 @@ CLAUDE_MODEL = os.environ.get("OSTV_CLAUDE_MODEL", "claude-haiku-4-5")
 
 AI_TOOLS_SCHEMA = [
     {
+        "name": "ha_lights",
+        "description": "Керування світлом через Home Assistant. Викликати коли користувач просить увімкнути/вимкнути/переключити світло. action: turn_on | turn_off | toggle. room — назва кімнати (українською або англ., рядок-фрагмент імені) або 'all' для всіх.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "action": {"type": "string", "enum": ["turn_on", "turn_off", "toggle"]},
+                "room": {"type": "string", "description": "наприклад 'вітальня', 'спальня', 'kitchen', 'all'"},
+            },
+            "required": ["action"],
+        },
+    },
+    {
+        "name": "ha_call",
+        "description": "Викликає будь-який сервіс Home Assistant. Для не-light entities: switch, media_player, climate, fan, scene, automation, тощо. Приклад: entity_id='switch.tv', service='turn_on'. Або entity_id='climate.living_room', service='set_temperature', data={'temperature': 22}.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "entity_id": {"type": "string"},
+                "service":   {"type": "string", "description": "turn_on/turn_off/toggle/set_temperature/play_media/..."},
+                "data":      {"type": "object", "description": "доп. параметри сервісу"},
+            },
+            "required": ["entity_id", "service"],
+        },
+    },
+    {
+        "name": "ha_states",
+        "description": "Отримати список entities Home Assistant з поточним state. Корисно щоб розвідати які кімнати/прилади доступні. domain: light/switch/sensor/climate/media_player/...",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "domain": {"type": "string"},
+                "limit":  {"type": "integer", "default": 30},
+            },
+        },
+    },
+    {
         "name": "search_all",
         "description": "Пошук фільмів/відео у всіх джерелах (YouTube + парсери). Повертає список результатів з title, url, thumbnail.",
         "input_schema": {
@@ -1807,6 +1843,129 @@ async def tool_update_apply(force: bool = False) -> dict:
         return {"ok": False, "error": str(e)}
 
 
+async def _ha_request(path: str, method: str = "GET", body: dict | None = None) -> dict:
+    """HTTP до Home Assistant REST API. /etc/ostv/secrets.env має містити:
+       HA_URL=http://192.168.88.X:8123
+       HA_TOKEN=eyJ...  (Long-Lived Access Token з HA → User profile)
+    """
+    import urllib.request, urllib.error
+    base = (_load_secret("HA_URL") or "").rstrip("/")
+    token = _load_secret("HA_TOKEN")
+    if not base:
+        return {"ok": False, "error": "Немає HA_URL у /etc/ostv/secrets.env"}
+    if not token:
+        return {"ok": False, "error": "Немає HA_TOKEN у /etc/ostv/secrets.env"}
+    url = f"{base}/api/{path.lstrip('/')}"
+    data = json.dumps(body).encode() if body is not None else None
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Content-Type": "application/json",
+    }
+    try:
+        def _do():
+            req = urllib.request.Request(url, data=data, headers=headers, method=method)
+            with urllib.request.urlopen(req, timeout=10) as r:
+                return r.read().decode()
+        raw = await asyncio.to_thread(_do)
+        try:
+            return {"ok": True, "data": json.loads(raw) if raw else None}
+        except json.JSONDecodeError:
+            return {"ok": True, "raw": raw[:500]}
+    except urllib.error.HTTPError as e:
+        body_txt = ""
+        try: body_txt = e.read().decode(errors="ignore")[:200]
+        except Exception: pass
+        return {"ok": False, "error": f"HA HTTP {e.code}: {body_txt}"}
+    except Exception as e:
+        return {"ok": False, "error": f"HA: {e}"}
+
+
+async def tool_ha_status() -> dict:
+    """Перевірка зв'язку з Home Assistant — повертає version+state count."""
+    base = _load_secret("HA_URL")
+    token = _load_secret("HA_TOKEN")
+    if not base or not token:
+        return {"ok": False, "configured": False,
+                "error": "Налаштуй HA_URL та HA_TOKEN у /etc/ostv/secrets.env"}
+    r = await _ha_request("config")
+    if not r.get("ok"):
+        return {"ok": False, "configured": True, **r}
+    cfg = r.get("data") or {}
+    s = await _ha_request("states")
+    n = len(s.get("data") or []) if s.get("ok") else 0
+    return {"ok": True, "configured": True,
+            "version": cfg.get("version"), "location": cfg.get("location_name"),
+            "entity_count": n, "url": base}
+
+
+async def tool_ha_states(domain: str | None = None, limit: int = 50) -> dict:
+    """Список entities (опційно фільтр за domain: light/switch/sensor/climate/...).
+    Повертає тільки entity_id + state + friendly_name."""
+    r = await _ha_request("states")
+    if not r.get("ok"):
+        return r
+    items = []
+    for e in r.get("data") or []:
+        eid = e.get("entity_id", "")
+        if domain and not eid.startswith(f"{domain}."):
+            continue
+        items.append({
+            "entity_id": eid,
+            "state": e.get("state"),
+            "name": (e.get("attributes") or {}).get("friendly_name", ""),
+        })
+        if len(items) >= limit:
+            break
+    return {"ok": True, "items": items, "total": len(items)}
+
+
+async def tool_ha_call(entity_id: str, service: str, data: dict | None = None) -> dict:
+    """Викликає HA service. Приклади:
+       ha_call("light.kitchen", "turn_on", {"brightness": 200})
+       ha_call("light.kitchen", "turn_off")
+       ha_call("switch.tv", "toggle")
+       ha_call("media_player.living_room", "media_pause")
+    Розбирає service: 'turn_on'/'toggle' → domain з entity_id; '<domain>.<service>' — explicit.
+    """
+    if not entity_id or "." not in entity_id:
+        return {"ok": False, "error": "entity_id має бути <domain>.<name>"}
+    if "." in service:
+        domain, svc = service.split(".", 1)
+    else:
+        domain = entity_id.split(".", 1)[0]
+        svc = service
+    body = {"entity_id": entity_id, **(data or {})}
+    return await _ha_request(f"services/{domain}/{svc}", method="POST", body=body)
+
+
+async def tool_ha_lights(action: str = "toggle", room: str | None = None) -> dict:
+    """Зручний короткий tool: керує усіма світлами (або у певній кімнаті).
+       action: turn_on | turn_off | toggle
+       room — за friendly_name (case-insensitive substring) або 'all' для всіх.
+    Приклад: ha_lights("turn_off", "вітальня") — гасить світло у вітальні.
+    """
+    if action not in ("turn_on", "turn_off", "toggle"):
+        return {"ok": False, "error": "action: turn_on | turn_off | toggle"}
+    states = await tool_ha_states(domain="light", limit=200)
+    if not states.get("ok"):
+        return states
+    targets = []
+    rl = (room or "").lower().strip()
+    for it in states.get("items", []):
+        if not rl or rl == "all":
+            targets.append(it["entity_id"])
+        elif rl in (it.get("name", "") or "").lower() or rl in it["entity_id"].lower():
+            targets.append(it["entity_id"])
+    if not targets:
+        return {"ok": False, "error": f"світла не знайдено для: '{room or 'all'}'",
+                "available_rooms": [it.get("name") for it in states.get("items", [])]}
+    results = []
+    for eid in targets:
+        r = await tool_ha_call(eid, action)
+        results.append({"entity_id": eid, "ok": r.get("ok"), "error": r.get("error")})
+    return {"ok": True, "action": action, "count": len(targets), "results": results}
+
+
 async def tool_power(action: str = "reboot") -> dict:
     """Power-керування. action: reboot | shutdown | suspend | logout"""
     valid = {"reboot", "shutdown", "poweroff", "suspend", "logout"}
@@ -2098,6 +2257,10 @@ TOOLS = {
     "history_clear": tool_history_clear,
     "update_check": tool_update_check,
     "update_apply": tool_update_apply,
+    "ha_status": tool_ha_status,
+    "ha_states": tool_ha_states,
+    "ha_call": tool_ha_call,
+    "ha_lights": tool_ha_lights,
     "list_files": tool_list_files,
     "play_playlist": tool_play_playlist,
     "mpv_control": tool_mpv_control,

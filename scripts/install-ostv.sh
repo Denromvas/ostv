@@ -24,7 +24,7 @@
 
 set -e
 
-OSTV_VERSION="${OSTV_VERSION:-0.1.7}"
+OSTV_VERSION="${OSTV_VERSION:-0.1.8}"
 RELEASE_URL="${RELEASE_URL:-https://denromvas.website/ostv/ostv-release-v${OSTV_VERSION}.tar.gz}"
 LOCAL_TARBALL=""
 SKIP_KIOSK=0
@@ -352,12 +352,116 @@ GT
     rm -rf /home/tv/.config/autostart/* 2>/dev/null || true
 fi
 
+# ---- 8.5. Interactive AI provider config (TTY only) ----
+if [ -t 0 ] && [ -t 1 ] && [ "$SKIP_KIOSK" != "1" ]; then
+    echo ""
+    echo "=== 8.5. AI provider setup ==="
+    echo "Куди підключатися OsTv Brain для AI-чату?"
+    echo "  1) claude_cli     — Anthropic Claude через CLI (OAuth, БЕЗ API key) [default]"
+    echo "  2) claude_api     — Anthropic API (треба ANTHROPIC_API_KEY)"
+    echo "  3) openai         — OpenAI API (треба OPENAI_API_KEY)"
+    echo "  4) gemini         — Google Gemini (треба GEMINI_API_KEY)"
+    echo "  5) openrouter     — OpenRouter (треба OPENROUTER_API_KEY, доступ до купи моделей)"
+    echo "  6) ollama         — Локальний Ollama (БЕЗ ключа, треба ollama serve)"
+    echo "  s) пропустити     — налаштую пізніше через Settings → AI provider"
+    echo ""
+    read -r -p "Вибір [1-6/s] (default 1): " AI_CHOICE
+    AI_CHOICE="${AI_CHOICE:-1}"
+
+    case "$AI_CHOICE" in
+        1|claude_cli)
+            cat > /etc/ostv/ai.conf <<EOF
+[ai]
+provider = "claude_cli"
+model = "claude-haiku-4-5"
+EOF
+            echo ""
+            echo "[ai] claude_cli обрано. ВАЖЛИВО — після ребуту виконай:"
+            echo "    sudo -u tv claude   # з'явиться URL → ввійди браузером claude.ai"
+            ;;
+        2|claude_api)
+            read -r -s -p "ANTHROPIC_API_KEY (sk-ant-...): " AI_KEY; echo
+            grep -v ANTHROPIC_API_KEY /etc/ostv/secrets.env > /etc/ostv/secrets.env.tmp 2>/dev/null || true
+            mv /etc/ostv/secrets.env.tmp /etc/ostv/secrets.env 2>/dev/null || true
+            echo "ANTHROPIC_API_KEY=$AI_KEY" >> /etc/ostv/secrets.env
+            cat > /etc/ostv/ai.conf <<EOF
+[ai]
+provider = "claude_api"
+model = "claude-haiku-4-5"
+EOF
+            ;;
+        3|openai)
+            read -r -s -p "OPENAI_API_KEY (sk-...): " AI_KEY; echo
+            echo "OPENAI_API_KEY=$AI_KEY" >> /etc/ostv/secrets.env
+            cat > /etc/ostv/ai.conf <<EOF
+[ai]
+provider = "openai"
+model = "gpt-4o-mini"
+base_url = "https://api.openai.com/v1"
+EOF
+            ;;
+        4|gemini)
+            read -r -s -p "GEMINI_API_KEY (AIza...): " AI_KEY; echo
+            echo "GEMINI_API_KEY=$AI_KEY" >> /etc/ostv/secrets.env
+            cat > /etc/ostv/ai.conf <<EOF
+[ai]
+provider = "gemini"
+model = "gemini-2.0-flash"
+EOF
+            ;;
+        5|openrouter)
+            read -r -s -p "OPENROUTER_API_KEY (sk-or-...): " AI_KEY; echo
+            echo "OPENROUTER_API_KEY=$AI_KEY" >> /etc/ostv/secrets.env
+            cat > /etc/ostv/ai.conf <<EOF
+[ai]
+provider = "openrouter"
+model = "anthropic/claude-haiku-4-5"
+base_url = "https://openrouter.ai/api/v1"
+EOF
+            ;;
+        6|ollama)
+            read -r -p "Ollama base_url [http://localhost:11434]: " OLLAMA_URL
+            OLLAMA_URL="${OLLAMA_URL:-http://localhost:11434}"
+            read -r -p "Ollama model [qwen2.5:3b]: " OLLAMA_MODEL
+            OLLAMA_MODEL="${OLLAMA_MODEL:-qwen2.5:3b}"
+            cat > /etc/ostv/ai.conf <<EOF
+[ai]
+provider = "ollama"
+model = "$OLLAMA_MODEL"
+base_url = "$OLLAMA_URL"
+EOF
+            ;;
+        s|skip|S)
+            echo "Пропущено. Дефолт: claude_cli (треба buсзе sudo -u tv claude)"
+            ;;
+        *)
+            echo "Невідомий вибір. Дефолт: claude_cli"
+            ;;
+    esac
+    chown root:ostv /etc/ostv/ai.conf /etc/ostv/secrets.env
+    chmod 0664 /etc/ostv/ai.conf
+    chmod 0660 /etc/ostv/secrets.env
+fi
+
 # ---- 9. Start Brain ----
 echo ""
 echo "=== 9. Starting ostv-brain.service ==="
 systemctl restart ostv-brain.service
 sleep 2
 systemctl is-active ostv-brain.service
+
+# ---- 9.5. AI healthcheck ----
+echo ""
+echo "=== 9.5. AI healthcheck ==="
+sleep 1
+AI_TEST=$(timeout 5 /opt/ostv/bin/brain.sh ai_status '{}' 2>&1 | head -c 500 || true)
+if echo "$AI_TEST" | grep -q '"healthy": true'; then
+    echo "✓ AI healthy"
+else
+    echo "⚠ AI не готовий — після першого логіну на kiosk:"
+    echo "    Settings → AI provider / API key, або виконай:"
+    echo "    sudo -u tv claude       # для claude_cli"
+fi
 
 # ---- 10. Done ----
 echo ""
